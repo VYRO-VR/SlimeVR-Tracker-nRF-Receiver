@@ -3,34 +3,49 @@
 
 /dts-v1/;
 #include <nordic/nrf52840_qiaa.dtsi>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
 
-//move to dtsi?
 &pinctrl {
 	pwm0_default: pwm0_default {
 		group1 {
-			psels = <NRF_PSEL(PWM_OUT0, 0, 15)>;
+			/* Common-cathode RGB LED (active high): R=P0.12, G=P1.09, B=P0.08 */
+			psels = <NRF_PSEL(PWM_OUT0, 0, 12)>,<NRF_PSEL(PWM_OUT1, 1, 9)>,<NRF_PSEL(PWM_OUT2, 0, 8)>;
 			nordic,drive-mode = <NRF_DRIVE_D0S1>;
 		};
 	};
 
 	pwm0_sleep: pwm0_sleep {
 		group1 {
-			psels = <NRF_PSEL(PWM_OUT0, 0, 15)>;
+			psels = <NRF_PSEL(PWM_OUT0, 0, 12)>,<NRF_PSEL(PWM_OUT1, 1, 9)>,<NRF_PSEL(PWM_OUT2, 0, 8)>;
 			low-power-enable;
 		};
 	};
 };
-//end
 
 / {
-	model = "foxdongle_npa_uf2";
+	model = "Foxapplication nRF52840 FoxDongle NPA";
 	compatible = "foxdongle_npa_uf2";
 
 	chosen {
+		zephyr,console = &cdc_acm_uart;
+		zephyr,shell-uart = &cdc_acm_uart;
+		zephyr,uart-mcumgr = &cdc_acm_uart;
+		zephyr,bt-mon-uart = &cdc_acm_uart;
+		zephyr,bt-c2h-uart = &cdc_acm_uart;
 		zephyr,sram = &sram0;
 		zephyr,flash = &flash0;
-		zephyr,console = &cdc_acm_uart0;
-		zephyr,shell-uart = &cdc_acm_uart0;
+		zephyr,ieee802154 = &ieee802154;
+	};
+
+	/* Skyworks RFX2401C front-end module (TX_EN / RX_EN two-pin control) */
+	nrf_radio_fem: radio_fem {
+		compatible = "generic-fem-two-ctrl-pins";
+		ctx-gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>;
+		ctx-settle-time-us = <23>;
+		crx-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+		crx-settle-time-us = <8>;
+		tx-gain-db = <22>;
+		rx-gain-db = <12>;
 	};
 
 	pwmleds {
@@ -38,27 +53,81 @@
 		pwm_led0: pwm_led_0 {
 			pwms = <&pwm0 0 PWM_MSEC(1) PWM_POLARITY_NORMAL>;
 		};
+		pwm_led1: pwm_led_1 {
+			pwms = <&pwm0 1 PWM_MSEC(1) PWM_POLARITY_NORMAL>;
+		};
+		pwm_led2: pwm_led_2 {
+			pwms = <&pwm0 2 PWM_MSEC(1) PWM_POLARITY_NORMAL>;
+		};
+	};
+	leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpio0 12 GPIO_OPEN_SOURCE>;
+			label = "Red LED 0";
+		};
+		led1: led_1 {
+			gpios = <&gpio1 9 GPIO_OPEN_SOURCE>;
+			label = "Green LED 1";
+		};
+		led2: led_2 {
+			gpios = <&gpio0 8 GPIO_OPEN_SOURCE>;
+			label = "Blue LED 2";
+		};
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio0 13 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 0";
+			zephyr,code = <INPUT_KEY_0>;
+		};
 	};
 
 	aliases {
+		sw0 = &button0;
 		pwm-led0 = &pwm_led0;
-	};
-
-	zephyr,user {
-		led-gpios = <&gpio0 15 GPIO_OPEN_SOURCE>;
+		pwm-led1 = &pwm_led1;
+		pwm-led2 = &pwm_led2;
+		led0 = &led0;
+		led1 = &led1;
+		led2 = &led2;
+		watchdog0 = &wdt0;
 	};
 };
 
+&reg0 {
+	status = "disabled";
+};
+
 &reg1 {
-	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+&radio {
+	fem = <&nrf_radio_fem>;
+};
+
+&adc {
+	status = "okay";
 };
 
 &gpio0 {
 	status = "okay";
 };
 
+&gpio1 {
+	status = "okay";
+};
+
 &gpiote {
 	status = "okay";
+};
+
+&uicr {
+	nfct-pins-as-gpios;
+	gpio-as-nreset;
 };
 
 &pwm0 {
@@ -68,10 +137,15 @@
 	pinctrl-names = "default", "sleep";
 };
 
+&ieee802154 {
+	status = "okay";
+};
+
 zephyr_udc0: &usbd {
 	compatible = "nordic,nrf-usbd";
 	status = "okay";
-	cdc_acm_uart0: cdc_acm_uart0 {
+
+	cdc_acm_uart: cdc_acm_uart {
 		compatible = "zephyr,cdc-acm-uart";
 	};
 };
