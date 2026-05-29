@@ -244,8 +244,8 @@ static void print_help(void)
 	printk(
 		"Button (SW0) - hold and release at the stage you want:\n"
 		"  Tap:                       Cancel pairing / status blink\n"
-		"  Hold ~3s (blue):           Enter pairing mode\n"
-		"  Hold ~6s:                  Shut down all trackers\n"
+		"  Hold ~3s (amber):          Shut down all trackers\n"
+		"  Hold ~6s (blue):           Enter pairing mode\n"
 	);
 
 #if DFU_EXISTS

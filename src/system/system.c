@@ -145,13 +145,13 @@ void sys_request_system_reboot(void)
  * the USB console.
  *
  *   tap  (<0.8s)      : exit pairing if active, else a brief "alive" blink
- *   hold 3s   (blue)  : enter pairing
- *   hold 6s   (amber) : shut down all trackers
+ *   hold 3s   (amber) : shut down all trackers
+ *   hold 6s   (blue)  : enter pairing
  *   hold 10s  (red)   : enter DFU / bootloader
  */
 #define BTN_TAP_MAX_MS   800
-#define BTN_PAIR_MS      3000
-#define BTN_SHUTDOWN_MS  6000
+#define BTN_SHUTDOWN_MS  3000
+#define BTN_PAIR_MS      6000
 #define BTN_DFU_MS       10000
 
 enum btn_stage {
@@ -220,10 +220,10 @@ static void button_thread(void)
 			enum btn_stage new_stage;
 			if (hold_duration >= BTN_DFU_MS)
 				new_stage = BTN_STAGE_DFU;
-			else if (hold_duration >= BTN_SHUTDOWN_MS)
-				new_stage = BTN_STAGE_SHUTDOWN;
 			else if (hold_duration >= BTN_PAIR_MS)
 				new_stage = BTN_STAGE_PAIR;
+			else if (hold_duration >= BTN_SHUTDOWN_MS)
+				new_stage = BTN_STAGE_SHUTDOWN;
 			else
 				new_stage = BTN_STAGE_WINDUP;
 
@@ -280,24 +280,24 @@ static void button_thread(void)
 				}
 				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
 			}
-			else if (press_duration < BTN_PAIR_MS)
+			else if (press_duration < BTN_SHUTDOWN_MS)
 			{
 				// Released in the wind-up dead-zone: deliberately do nothing
-				LOG_INF("Released before pair threshold (%lldms), no action", press_duration);
+				LOG_INF("Released before shutdown threshold (%lldms), no action", press_duration);
 				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
 			}
-			else if (press_duration < BTN_SHUTDOWN_MS)
+			else if (press_duration < BTN_PAIR_MS)
+			{
+				LOG_INF("Shutdown all trackers");
+				esb_request_all_shutdown();
+				set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
+			}
+			else if (press_duration < BTN_DFU_MS)
 			{
 				LOG_INF("Enter pairing mode");
 				set_status(SYS_STATUS_PAIRING_MODE, true);
 				esb_start_pairing(); // drives the blue pairing blink (connection priority)
 				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST); // reveal it
-			}
-			else if (press_duration < BTN_DFU_MS)
-			{
-				LOG_INF("Shutdown all trackers");
-				esb_request_all_shutdown();
-				set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
 			}
 			else
 			{
