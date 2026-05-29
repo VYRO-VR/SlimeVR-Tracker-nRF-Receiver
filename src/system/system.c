@@ -138,160 +138,177 @@ void sys_request_system_reboot(void)
 }
 
 #if BUTTON_EXISTS
+/*
+ * SW0 gestures - one escalating press-and-hold. The LED steps through stages
+ * while held, so the user releases on the action they want. Nothing
+ * destructive lives here: clearing pairings is boot-only (see main.c) or via
+ * the USB console.
+ *
+ *   tap  (<0.8s)      : exit pairing if active, else a brief "alive" blink
+ *   hold 3s   (blue)  : enter pairing
+ *   hold 6s   (amber) : shut down all trackers
+ *   hold 10s  (red)   : enter DFU / bootloader
+ */
+#define BTN_TAP_MAX_MS   800
+#define BTN_PAIR_MS      3000
+#define BTN_SHUTDOWN_MS  6000
+#define BTN_DFU_MS       10000
+
+enum btn_stage {
+	BTN_STAGE_WINDUP = 0,
+	BTN_STAGE_PAIR,
+	BTN_STAGE_SHUTDOWN,
+	BTN_STAGE_DFU,
+};
+
+static void button_enter_dfu(void)
+{
+#if DFU_EXISTS
+#if CONFIG_BUILD_OUTPUT_UF2 // Adafruit bootloader
+	NRF_POWER->GPREGRET = 0x57;
+#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER // NRF5 bootloader
+	const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	if (device_is_ready(gpio_dev))
+	{
+		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
+	}
+#else
+	*dbl_reset_mem = DFU_DBL_RESET_APP;
+	ram_range_retain(dbl_reset_mem, sizeof(*dbl_reset_mem), true);
+#endif
+	k_msleep(100);
+#endif
+	sys_request_system_reboot();
+}
+
 static void button_thread(void)
 {
-	int num_presses = 0;
-	int64_t last_press = 0;
 	int64_t press_start_time = 0;
-	bool long_press_5s_handled = false;
-	bool long_press_10s_handled = false;
+	enum btn_stage stage = BTN_STAGE_WINDUP;
 	int64_t last_blink_time = 0;
 	bool led_state = false;
-	bool long_press_5s_triggered = false; // Track if 5s function has been triggered
+
+	// The button may already be held at boot, where main() treats a long hold
+	// as a factory reset. Wait for that press to be released and discard it so
+	// the runtime gesture machine never re-acts on the boot hold.
+	while (button_read())
+		k_msleep(50);
+	press_time = 0;
+	last_press_duration = 0;
 
 	while (1)
 	{
-		// Handle button press start - immediate response
+		// Press start - immediate feedback
 		if (press_time && !press_start_time)
 		{
 			press_start_time = press_time;
-			long_press_5s_handled = false;
-			long_press_10s_handled = false;
-			long_press_5s_triggered = false;
+			stage = BTN_STAGE_WINDUP;
 			set_status(SYS_STATUS_BUTTON_PRESSED, true);
-			// Immediate LED response
 			set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_HIGHEST);
 			last_blink_time = k_uptime_get();
 			led_state = true;
 			LOG_INF("Button press started");
 		}
 
-		// Handle button press duration - blink every second to confirm time
+		// Hold - advance the LED stage by duration so the user can release on
+		// the action they want; blink once per second during the wind-up.
 		if (press_time && button_read())
 		{
 			int64_t current_time = k_uptime_get();
 			int64_t hold_duration = current_time - press_start_time;
 
-			// Blink every second to confirm timing
-			if (current_time - last_blink_time >= 1000)
+			enum btn_stage new_stage;
+			if (hold_duration >= BTN_DFU_MS)
+				new_stage = BTN_STAGE_DFU;
+			else if (hold_duration >= BTN_SHUTDOWN_MS)
+				new_stage = BTN_STAGE_SHUTDOWN;
+			else if (hold_duration >= BTN_PAIR_MS)
+				new_stage = BTN_STAGE_PAIR;
+			else
+				new_stage = BTN_STAGE_WINDUP;
+
+			if (new_stage != stage)
+			{
+				stage = new_stage;
+				switch (stage)
+				{
+				case BTN_STAGE_PAIR: // blue: release to pair
+					set_led(SYS_LED_PATTERN_SHORT, SYS_LED_PRIORITY_HIGHEST);
+					break;
+				case BTN_STAGE_SHUTDOWN: // amber: release to shut down all trackers
+					set_led(SYS_LED_PATTERN_LONG_PERSIST, SYS_LED_PRIORITY_HIGHEST);
+					break;
+				case BTN_STAGE_DFU: // red: release to enter DFU
+					set_led(SYS_LED_PATTERN_ERROR_D, SYS_LED_PRIORITY_HIGHEST);
+					break;
+				default:
+					break;
+				}
+				LOG_INF("Button hold stage %d (%lldms)", stage, hold_duration);
+			}
+
+			if (stage == BTN_STAGE_WINDUP && current_time - last_blink_time >= 1000)
 			{
 				led_state = !led_state;
-				if (led_state)
-					set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_HIGHEST);
-				else
-					set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
+				set_led(led_state ? SYS_LED_PATTERN_ON : SYS_LED_PATTERN_OFF,
+					SYS_LED_PRIORITY_HIGHEST);
 				last_blink_time = current_time;
-				LOG_INF("Button held for %lld seconds", hold_duration / 1000);
 			}
-
-			// Handle long press actions with proper sequencing
-			if (hold_duration >= 10000 && !long_press_10s_handled) // 10 seconds - DFU mode
-			{
-				LOG_INF("DFU mode requested (10s)");
-				set_led(SYS_LED_PATTERN_ERROR_D, SYS_LED_PRIORITY_HIGHEST);
-#if DFU_EXISTS
-#if CONFIG_BUILD_OUTPUT_UF2 // Adafruit bootloader
-				NRF_POWER->GPREGRET = 0x57;
-#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER // NRF5 bootloader
-				// Use GPIO method to enter DFU
-				const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
-				if (device_is_ready(gpio_dev))
-				{
-					gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-				}
-#else
-				// Use double reset memory method as fallback
-				*dbl_reset_mem = DFU_DBL_RESET_APP;
-				ram_range_retain(dbl_reset_mem, sizeof(*dbl_reset_mem), true);
-#endif
-				// Wait a bit to ensure data is written
-				k_msleep(100);
-#endif
-				// System reboot to enter DFU
-				sys_request_system_reboot();
-				long_press_10s_handled = true;
-				return; // Exit thread as system will reboot
-			}
-			// Note: 5s function is no longer triggered during hold, only checked on release
 		}
 
-		// Handle button release
+		// Release - act on the stage band the hold landed in
 		if (last_press_duration > 50 && press_start_time) // debounce
 		{
 			int64_t press_duration = last_press_duration;
 			last_press_duration = 0;
+			press_start_time = 0;
+			stage = BTN_STAGE_WINDUP;
+			set_status(SYS_STATUS_BUTTON_PRESSED, false);
 
-			// Check for long press (execute 5s function only on release)
-			if (press_duration >= 5000 && press_duration < 10000 && !long_press_5s_triggered)
+			if (press_duration < BTN_TAP_MAX_MS)
 			{
-				LOG_INF("Clear all pairings requested (5s) - triggered on release");
-				esb_clear();
-				set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_HIGHEST);
-				long_press_5s_triggered = true;
-				// Reset counters
-				num_presses = 0;
-				last_press = 0;
+				// Tap: cancel pairing if open, otherwise just confirm we're alive
+				if (get_status(SYS_STATUS_PAIRING_MODE))
+				{
+					LOG_INF("Tap: exit pairing mode");
+					esb_finish_pair();
+					set_status(SYS_STATUS_PAIRING_MODE, false);
+				}
+				else
+				{
+					LOG_INF("Tap: identify");
+				}
+				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
 			}
-			else if (press_duration < 5000) // Only short presses count for press sequences
+			else if (press_duration < BTN_PAIR_MS)
 			{
-				num_presses++;
-				LOG_INF("Button pressed %d times (duration: %lldms)", num_presses, press_duration);
-				last_press = k_uptime_get();
+				// Released in the wind-up dead-zone: deliberately do nothing
+				LOG_INF("Released before pair threshold (%lldms), no action", press_duration);
+				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
+			}
+			else if (press_duration < BTN_SHUTDOWN_MS)
+			{
+				LOG_INF("Enter pairing mode");
+				set_status(SYS_STATUS_PAIRING_MODE, true);
+				esb_start_pairing(); // drives the blue pairing blink (connection priority)
+				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST); // reveal it
+			}
+			else if (press_duration < BTN_DFU_MS)
+			{
+				LOG_INF("Shutdown all trackers");
+				esb_request_all_shutdown();
+				set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
 			}
 			else
 			{
-				LOG_INF("Long press completed (duration: %lldms)", press_duration);
-				// Reset counters
-				num_presses = 0;
-				last_press = 0;
+				LOG_INF("DFU mode requested (>=10s)");
+				set_led(SYS_LED_PATTERN_ERROR_D, SYS_LED_PRIORITY_HIGHEST);
+				button_enter_dfu();
+				return; // system will reboot
 			}
-
-			press_start_time = 0;
-
-			// Clear button pressed status and LED
-			set_status(SYS_STATUS_BUTTON_PRESSED, false);
-			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
-			long_press_5s_handled = false;
-			long_press_10s_handled = false;
 		}
 
-		// Handle multiple press patterns (only for short presses)
-		if (last_press && k_uptime_get() - last_press > 1000 && num_presses > 0)
-		{
-			LOG_INF("Button sequence completed: %d presses", num_presses);
-
-			switch (num_presses)
-			{
-			case 1: // Shutdown all active trackers
-				LOG_INF("Shutdown all trackers requested");
-				esb_request_all_shutdown();
-				set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
-				break;
-
-			case 2: // Exit pairing mode
-				LOG_INF("Exit pairing mode requested");
-				esb_finish_pair();
-				set_status(SYS_STATUS_PAIRING_MODE, false);
-				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
-				break;
-
-			case 3: // Enter pairing mode (non-blocking)
-				LOG_INF("Enter pairing mode requested");
-				set_status(SYS_STATUS_PAIRING_MODE, true);
-				// Use non-blocking pairing mode
-				esb_start_pairing();
-				break;
-
-			default:
-				LOG_WRN("Unknown button sequence: %d presses", num_presses);
-				break;
-			}
-
-			num_presses = 0;
-			last_press = 0;
-		}
-
-		k_msleep(50); // Reduce check interval to improve responsiveness
+		k_msleep(50);
 	}
 }
 #endif

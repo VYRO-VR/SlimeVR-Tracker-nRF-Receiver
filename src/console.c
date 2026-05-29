@@ -242,16 +242,16 @@ static void print_help(void)
 	);
 
 	printk(
-		"Button Functions:\n"
-		"  Short press (1x):          Status check\n"
-		"  Quick press (2x):          Exit pairing mode\n"
-		"  Quick press (3x):          Enter pairing mode\n"
-		"  Long press (5s):           Clear all pairings\n"
+		"Button (SW0) - hold and release at the stage you want:\n"
+		"  Tap:                       Cancel pairing / status blink\n"
+		"  Hold ~3s (blue):           Enter pairing mode\n"
+		"  Hold ~6s:                  Shut down all trackers\n"
 	);
 
 #if DFU_EXISTS
-	printk("  Long press (10s):          Enter DFU mode\n");
+	printk("  Hold ~10s (red):           Enter DFU mode\n");
 #endif
+	printk("  Factory reset:             hold SW0 while plugging in, or 'clear'\n");
 	printk("\n");
 }
 
@@ -265,19 +265,9 @@ static void print_list(void)
 
 static void console_thread(void)
 {
-#if DFU_EXISTS
-	if (button_read()) // button held on usb connect, enter DFU
-	{
-#if ADAFRUIT_BOOTLOADER
-		request_local_dfu(false);
-#endif
-#if NRF5_BOOTLOADER
-		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-		k_msleep(100); // Wait for GPIO to be configured
-		sys_reboot(SYS_REBOOT_COLD);
-#endif
-	}
-#endif
+	// A button held at boot is handled by main() as a factory reset. DFU entry
+	// is via the 10s runtime hold, the 'dfu' console command, or the recessed
+	// RST double-tap - not from a boot-time button hold.
 
 	/* Data collection: HID mode uses SYS_INIT, CDC mode needs manual init */
 #if defined(CONFIG_DATA_COLLECT) && !defined(CONFIG_DATA_COLLECT_HID)

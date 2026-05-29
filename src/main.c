@@ -54,14 +54,18 @@ int main(void)
 
 		while (button_read())
 		{
-			if (k_uptime_get() - boot_start > 1000)
-				set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_HIGHEST);
-			if (k_uptime_get() - boot_start > 5000)
+			int64_t held = k_uptime_get() - boot_start;
+			if (held > 5000)
 			{
-				LOG_INF("Boot-time pairing reset requested");
+				// Factory reset: the only destructive action, gated behind a
+				// deliberate hold-while-plugging-in. Red LED is the commit signal.
+				LOG_INF("Boot-time factory reset (clear all pairings)");
+				set_led(SYS_LED_PATTERN_ERROR_D, SYS_LED_PRIORITY_HIGHEST);
 				esb_clear();
 				break;
 			}
+			if (held > 1000)
+				set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_HIGHEST);
 			k_msleep(10);
 		}
 
