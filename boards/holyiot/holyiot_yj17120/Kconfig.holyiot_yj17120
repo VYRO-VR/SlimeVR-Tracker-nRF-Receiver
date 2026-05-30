@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_HOLYIOT_YJ17120
+	select SOC_NRF52840_QIAA
+
+if BOARD_HOLYIOT_YJ17120
+
+config BOARD_HAS_NRF5_BOOTLOADER
+	bool "Board has nRF5 bootloader"
+	default y
+	help
+	  If selected, applications are linked so that they can be loaded by the
+	  Nordic nRF5 (Adafruit-style UF2) bootloader.
+
+config BOARD_SERIAL_BACKEND_CDC_ACM
+	bool "USB CDC"
+	default y
+
+# NOTE: No FEM. Unlike holyiot_21017, this board has no external front-end
+# module, so none of the MPSL_FEM options are selected here.
+
+config BOARD_ENABLE_DCDC
+	bool "DCDC mode"
+	select SOC_DCDC_NRF52X
+	default n
+
+endif # BOARD_HOLYIOT_YJ17120

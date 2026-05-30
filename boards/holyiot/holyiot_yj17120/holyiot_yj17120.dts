@@ -1,0 +1,92 @@
+// HolyIOT YJ-17120 nRF52840 USB Dongle (no PA / no FEM).
+//
+// Derived from SlimeVR's holyiot_21017 board, with the external Skyworks
+// front-end module (FEM/PA) REMOVED. This dongle is a plain nRF52840-QIAA with
+// a chip antenna and NO power amplifier (confirmed from the manufacturer
+// schematic in firmware/docs/). Flashing the 21017 target onto it configures
+// the radio for a +22 dB external amplifier that isn't present and toggles
+// P0.24/P0.22 as PA-control pins, collapsing usable range to ~10 cm.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/dts-v1/;
+#include <nordic/nrf52840_qiaa.dtsi>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+
+/ {
+	model = "Holyiot YJ-17120 nRF52840 Dongle";
+	compatible = "nordic,nrf52840-dongle-nrf52840";
+
+	chosen {
+		zephyr,console = &cdc_acm_uart;
+		zephyr,shell-uart = &cdc_acm_uart;
+		zephyr,uart-mcumgr = &cdc_acm_uart;
+		zephyr,bt-mon-uart = &cdc_acm_uart;
+		zephyr,bt-c2h-uart = &cdc_acm_uart;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,ieee802154 = &ieee802154;
+	};
+
+	// No nrf_radio_fem node: this board has no external PA/LNA. The radio
+	// drives the chip antenna directly. ESB/RADIO TX power is set by the
+	// SlimeNRF application to the nRF52840 internal maximum (+8 dBm).
+
+	leds {
+		compatible = "gpio-leds";
+		// Single red LED: P1.01 -> 510R -> LED -> GND (anode to GPIO),
+		// so driving the pin HIGH lights it. (Per YJ-17120 schematic.)
+		led0_red: led_0 {
+			gpios = <&gpio1 1 GPIO_ACTIVE_HIGH>;
+			label = "Red LED 0";
+		};
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		// The YJ-17120 has no user button populated; expose the RESET-adjacent
+		// SWD only. Keep a placeholder alias-free so builds that require sw0
+		// still need attention rather than silently using a wrong pin.
+	};
+
+	aliases {
+		led0 = &led0_red;
+		watchdog0 = &wdt0;
+	};
+};
+
+&reg1 {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+// &radio intentionally has NO `fem` property — direct-drive antenna.
+
+&gpiote {
+	status = "okay";
+};
+
+&uicr {
+	nfct-pins-as-gpios;
+	gpio-as-nreset;
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&ieee802154 {
+	status = "okay";
+};
+
+zephyr_udc0: &usbd {
+	compatible = "nordic,nrf-usbd";
+	status = "okay";
+
+	cdc_acm_uart: cdc_acm_uart {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

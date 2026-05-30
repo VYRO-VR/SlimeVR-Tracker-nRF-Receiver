@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
+board:
+  name: holyiot_yj17120
+  full_name: Holyiot YJ-17120 nRF52840 Dongle
+  vendor: holyiot
+  socs:
+  - name: nrf52840

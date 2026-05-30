@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+
+identifier: holyiot_yj17120/nrf52840
+name: holyiot_yj17120
+type: mcu
+arch: arm
+ram: 256
+flash: 1024
+toolchain:
+  - zephyr
+  - gnuarmemb
+  - xtools
+supported:
+  - usb_device
+  - ble
+  - watchdog
+  - gpio
+  - netif:openthread
+vendor: holyiot

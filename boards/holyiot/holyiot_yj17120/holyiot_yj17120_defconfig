@@ -1,0 +1,27 @@
+# HolyIOT YJ-17120 — no FEM/PA build.
+# SPDX-License-Identifier: Apache-2.0
+
+CONFIG_ARM_MPU=y
+CONFIG_HW_STACK_PROTECTION=y
+CONFIG_GPIO=y
+CONFIG_USB_DEVICE_REMOTE_WAKEUP=n
+
+CONFIG_USB_DEVICE_MANUFACTURER="Holyiot"
+CONFIG_USB_DEVICE_PRODUCT="SlimeNRF Receiver YJ-17120"
+
+# Single LED only — do NOT enable RGB.
+# CONFIG_LED_RGB_COLOR is not set
+
+CONFIG_USE_SEGGER_RTT=y
+CONFIG_RTT_CONSOLE=y
+CONFIG_LOG_BACKEND_RTT=y
+
+# IMPORTANT: this board has NO front-end module. The 21017 target enables
+# CONFIG_MPSL_FEM / CONFIG_MPSL_FEM_SIMPLE_GPIO, which under-drives the radio
+# expecting an external PA. Those are intentionally OMITTED here so the radio
+# transmits at full internal power.
+
+# Override the FEM-tuned global (prj.conf sets 30 dBm assuming a +22 dB FEM).
+# With no FEM the nRF52840 max is +8 dBm; pin it here so the driver doesn't
+# silently clamp.
+CONFIG_RADIO_TX_POWER=8
