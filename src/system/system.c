@@ -166,12 +166,10 @@ static void button_enter_dfu(void)
 #if DFU_EXISTS
 #if CONFIG_BUILD_OUTPUT_UF2 // Adafruit bootloader
 	NRF_POWER->GPREGRET = 0x57;
-#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER // NRF5 bootloader
-	const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
-	if (device_is_ready(gpio_dev))
-	{
-		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-	}
+#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER // Nordic Open USB Bootloader
+	// BOOTLOADER_DFU_START magic from the Nordic SDK. The bootloader checks
+	// GPREGRET on reset and stays in DFU mode if it sees this value.
+	NRF_POWER->GPREGRET = 0xB1;
 #else
 	*dbl_reset_mem = DFU_DBL_RESET_APP;
 	ram_range_retain(dbl_reset_mem, sizeof(*dbl_reset_mem), true);

@@ -55,10 +55,9 @@ K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, 6, 0,
 #define NRF5_BOOTLOADER CONFIG_BOARD_HAS_NRF5_BOOTLOADER
 #define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
 #define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
-
-#if NRF5_BOOTLOADER
-static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
-#endif
+// Nordic Open USB Bootloader (the pca10059 / Holyiot dongle bootloader).
+// Trigger value is BOOTLOADER_DFU_START from the Nordic SDK.
+#define NRF5_DFU_MAGIC_RESET 0xB1
 
 static const char *meows[] = {
 	"Mew", "Meww", "Meow", "Meow meow", "Mrrrp", "Mrrf", "Mreow", "Mrrrow", "Mrrr", "Purr",
@@ -85,8 +84,13 @@ static void request_local_dfu(bool ota)
 	k_msleep(100);
 	sys_reboot(SYS_REBOOT_COLD);
 #elif NRF5_BOOTLOADER
+	// Nordic Open USB Bootloader: writes BOOTLOADER_DFU_START into GPREGRET
+	// so the bootloader stays in DFU mode on next boot instead of jumping to
+	// the app. The older legacy-bootloader "drive P0.19 low + reset" trick
+	// does nothing on this bootloader and was the cause of the dfu command
+	// silently rebooting back into the app on Holyiot dongles.
 	ARG_UNUSED(ota);
-	gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
+	NRF_POWER->GPREGRET = NRF5_DFU_MAGIC_RESET;
 	k_msleep(100);
 	sys_reboot(SYS_REBOOT_COLD);
 #else

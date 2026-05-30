@@ -26,8 +26,9 @@ CONFIG_LOG_BACKEND_RTT=y
 # silently clamp.
 CONFIG_RADIO_TX_POWER=8
 
-# Produce a drag-and-drop .uf2 for the Adafruit UF2 bootloader (double-tap
-# reset, then copy onto the mass-storage drive). Application is linked at
-# 0x1000 to match the bootloader's expected offset.
-CONFIG_BUILD_OUTPUT_UF2=y
+# Link the application at 0x1000 to match the Nordic Open USB Bootloader's
+# app slot on this dongle. The bootloader uses the Nordic SDFU protocol over
+# CDC ACM (.hex via nRF Connect Programmer / nrfutil), not Adafruit UF2 - so
+# CONFIG_BUILD_OUTPUT_UF2 is intentionally NOT enabled here; the deliverable
+# is the .hex.
 CONFIG_FLASH_LOAD_OFFSET=0x1000
