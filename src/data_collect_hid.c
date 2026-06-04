@@ -25,7 +25,7 @@
  * Data collection via dedicated HID endpoint (HID_1).
  *
  * Each raw ESB packet is forwarded as a single 64-byte HID input report:
- *   [0..N-1]  ESB payload (up to 48 bytes)
+ *   [0..N-1]  ESB payload (up to 52 bytes: 48 for type 0x10, 52 for type 0x13)
  *   [N]       RSSI
  *   [N+1..N+4] rx_ticks (BE32)
  *   [N+5..63]  zero padding
@@ -233,7 +233,8 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 	uint8_t *report = dc_fifo[wr];
 	memset(report, 0, 64);
 
-	uint8_t copy_len = (len > 48) ? 48 : len;
+	/* Allow up to 52 bytes for type 0x13 (gyrQuat) packets */
+	uint8_t copy_len = (len > 52) ? 52 : len;
 	memcpy(report, data, copy_len);
 
 	uint8_t pos = copy_len;

@@ -18,8 +18,8 @@ HID report format (64 bytes):
   [N+5..63]   zero padding
 
 Packet types in ESB payload (byte 0):
-  0x10: Raw IMU (48 bytes) - float gyro+accel (+optional mag) + T-Cal temp
-  0x11: Raw Mag (17 bytes) - float magnetometer
+  0x10: Raw IMU (48 bytes) - float gyro+accel (+optional body-frame aligned mag) + T-Cal temp
+  0x11: Raw Mag (17 bytes) - float body-frame aligned magnetometer
   0x12: Metadata (48 bytes) - ODR, range, sensor IDs
 
 Output: CSV file with columns: seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp
@@ -74,6 +74,134 @@ class SensorMetadata:
         )
 
 
+class CalibrationData:
+    """Stores calibration data from type 0x14 packets."""
+
+    def __init__(self):
+        self.accel_BAinv = None   # 4×3 matrix (list of 12 floats)
+        self.mag_BAinv = None     # 4×3 matrix (list of 12 floats)
+        self.gyro_bias = None     # [3] floats (deg/s)
+        self.gyro_sens_scale = None  # [3] floats
+        self.tcal_enabled = False
+        self.tcal_num_points = 0
+        self.tcal_temp_min = 0.0
+        self.tcal_temp_max = 0.0
+        self.tcal_correction_offset = None  # [3] floats
+        self.tcal_points = []     # list of (temp, bx, by, bz) tuples
+        self._tcal_pending_points = []
+        self._tcal_pending_chunk_idx = -1
+
+    @staticmethod
+    def _is_valid_tcal_point(point):
+        temp, bx, by, bz = point
+        if not all(math.isfinite(v) for v in point):
+            return False
+        return not (temp == 0.0 and bx == 0.0 and by == 0.0 and bz == 0.0)
+
+    @classmethod
+    def _normalize_tcal_points(cls, points):
+        deduped = {}
+        for point in points:
+            if not cls._is_valid_tcal_point(point):
+                continue
+            deduped[f"{point[0]:.2f}"] = point
+        return [deduped[key] for key in sorted(deduped, key=lambda k: float(k))]
+
+    def parse(self, payload: bytes):
+        """Parse a type 0x14 calibration packet. Sub-type at byte[2]."""
+        if len(payload) < 4:
+            return
+        sub_type = payload[2]
+        if sub_type == 0x01:  # ACCEL_CAL
+            if len(payload) >= 51:  # 3 + 48
+                self.accel_BAinv = list(struct.unpack_from("<12f", payload, 3))
+                print(f"  Calibration: accel BAinv received")
+        elif sub_type == 0x02:  # MAG_CAL
+            if len(payload) >= 51:
+                self.mag_BAinv = list(struct.unpack_from("<12f", payload, 3))
+                print(f"  Calibration: mag BAinv received")
+        elif sub_type == 0x03:  # GYRO_CAL
+            if len(payload) >= 27:  # 3 + 24
+                self.gyro_bias = list(struct.unpack_from("<3f", payload, 3))
+                self.gyro_sens_scale = list(struct.unpack_from("<3f", payload, 15))
+                print(f"  Calibration: gyro bias + sens received")
+        elif sub_type == 0x04:  # TCAL_STATE
+            if len(payload) >= 26:
+                self.tcal_enabled = bool(payload[3])
+                self.tcal_num_points = struct.unpack_from("<H", payload, 4)[0]
+                self.tcal_temp_min = struct.unpack_from("<f", payload, 6)[0]
+                self.tcal_temp_max = struct.unpack_from("<f", payload, 10)[0]
+                self.tcal_correction_offset = list(
+                    struct.unpack_from("<3f", payload, 14)
+                )
+                print(
+                    f"  Calibration: T-Cal state (enabled={self.tcal_enabled}, "
+                    f"points={self.tcal_num_points}, "
+                    f"range={self.tcal_temp_min:.0f}-{self.tcal_temp_max:.0f}°C)"
+                )
+                if self.tcal_num_points == 0:
+                    self.tcal_points = []
+                    self._tcal_pending_points = []
+                    self._tcal_pending_chunk_idx = -1
+        elif sub_type == 0x05:  # TCAL_POINTS
+            if len(payload) >= 23:
+                # [3] chunk_idx [4-5] total_count [6] num_in_chunk
+                # [7-22] point[0] [23-38] point[1]
+                chunk_idx = payload[3]
+                total_count = struct.unpack_from("<H", payload, 4)[0]
+                num_in_chunk = payload[6]
+                last_chunk_idx = ((total_count - 1) // 2) if total_count > 0 else 0
+                if chunk_idx == 0 or self._tcal_pending_chunk_idx >= chunk_idx:
+                    self._tcal_pending_points = []
+                for j in range(num_in_chunk):
+                    offset = 7 + j * 16
+                    if offset + 16 <= len(payload):
+                        temp, bx, by, bz = struct.unpack_from("<4f", payload, offset)
+                        self._tcal_pending_points.append((temp, bx, by, bz))
+                self._tcal_pending_chunk_idx = chunk_idx
+                normalized = self._normalize_tcal_points(self._tcal_pending_points)
+                if not self.tcal_points:
+                    self.tcal_points = normalized
+                    self.tcal_num_points = len(self.tcal_points)
+                if chunk_idx >= last_chunk_idx:
+                    self.tcal_points = normalized
+                    self._tcal_pending_points = []
+                    self._tcal_pending_chunk_idx = -1
+                    self.tcal_num_points = len(self.tcal_points)
+                if len(normalized) <= 2:  # Print only on first chunk
+                    print(f"  Calibration: T-Cal points receiving...")
+
+    def write_to_file(self, f):
+        """Append calibration data to metadata file (vqf_core.py-compatible format)."""
+        self.tcal_points = self._normalize_tcal_points(self.tcal_points)
+        self.tcal_num_points = len(self.tcal_points)
+        f.write("\n# Calibration data (from tracker retained memory)\n")
+        # Accel: split BAinv[12] → bias (row 0) + matrix (rows 1-3)
+        if self.accel_BAinv is not None and len(self.accel_BAinv) == 12:
+            f.write(f"acc_cal_bias={','.join(f'{v:.9g}' for v in self.accel_BAinv[:3])}\n")
+            f.write(f"acc_cal_matrix={','.join(f'{v:.9g}' for v in self.accel_BAinv[3:])}\n")
+        # Mag: split BAinv[12] → bias (row 0) + matrix (rows 1-3)
+        if self.mag_BAinv is not None and len(self.mag_BAinv) == 12:
+            f.write(f"mag_cal_bias={','.join(f'{v:.9g}' for v in self.mag_BAinv[:3])}\n")
+            f.write(f"mag_cal_matrix={','.join(f'{v:.9g}' for v in self.mag_BAinv[3:])}\n")
+        if self.gyro_bias is not None:
+            f.write(f"gyro_bias={','.join(f'{v:.9g}' for v in self.gyro_bias)}\n")
+        if self.gyro_sens_scale is not None:
+            f.write(f"gyro_sens_scale={','.join(f'{v:.9g}' for v in self.gyro_sens_scale)}\n")
+        # T-Cal: compact gyro_tcal format (temp:bx,by,bz;temp:bx,by,bz;...)
+        if self.tcal_points:
+            entries = [f"{t:.2f}:{bx:.5f},{by:.5f},{bz:.5f}"
+                       for t, bx, by, bz in self.tcal_points]
+            f.write(f"gyro_tcal={';'.join(entries)}\n")
+
+    @property
+    def has_data(self):
+        return any([
+            self.accel_BAinv, self.mag_BAinv,
+            self.gyro_bias, self.tcal_enabled, self.tcal_points
+        ])
+
+
 def parse_raw_imu(payload: bytes):
     """Parse type 0x10 raw IMU packet. Returns sample dict."""
     if len(payload) < 42:
@@ -98,6 +226,36 @@ def parse_raw_imu(payload: bytes):
     return {
         "seq": seq,
         "gyro": (gx, gy, gz),
+        "accel": (ax, ay, az),
+        "mag": mag,
+        "temp_c": temp_c,
+    }
+
+
+def parse_raw_imu_quat(payload: bytes):
+    """Parse type 0x13 raw IMU + gyrQuat packet (52 bytes). Returns sample dict."""
+    if len(payload) < 46:
+        return None
+
+    seq = struct.unpack_from(">H", payload, 2)[0]
+    qw, qx, qy, qz = struct.unpack_from("<ffff", payload, 4)
+    ax, ay, az = struct.unpack_from("<fff", payload, 20)
+
+    flags = payload[44]
+    temp_c = None
+    if len(payload) >= 49:
+        tcal_temp_c = struct.unpack_from("<f", payload, 45)[0]
+        if math.isfinite(tcal_temp_c) and -100.0 < tcal_temp_c < 150.0:
+            temp_c = tcal_temp_c
+
+    mag = None
+    if flags & 0x01:
+        mx, my, mz = struct.unpack_from("<fff", payload, 32)
+        mag = (mx, my, mz)
+
+    return {
+        "seq": seq,
+        "gyr_quat": (qw, qx, qy, qz),
         "accel": (ax, ay, az),
         "mag": mag,
         "temp_c": temp_c,
@@ -176,6 +334,7 @@ def collect_hid(output_path, duration=None, device_index=None):
     h.open_path(dev_path)
 
     meta = SensorMetadata()
+    cal = CalibrationData()
     start_time = time.time()
     first_sample_time = None  # set when first data sample arrives
     frame_count = 0
@@ -185,10 +344,11 @@ def collect_hid(output_path, duration=None, device_index=None):
     last_rssi = 0
     retransmit_count = 0  # packets that filled a gap in the reorder buffer
     gap_count = 0  # sequence gaps that were never filled (actual loss)
+    meta_written = False  # metadata file written once on first IMU data
 
     # Reorder buffer: holds samples until we can write them in order.
     # Keyed by sequence number; flushed when contiguous run available.
-    REORDER_BUF_MAX = 128  # max buffered samples before force-flush
+    REORDER_BUF_MAX = 200  # match receiver raw ARQ stale window before force-flush
     reorder_buf = {}  # seq -> csv_line
     write_cursor = None  # next seq expected to be written
 
@@ -204,6 +364,7 @@ def collect_hid(output_path, duration=None, device_index=None):
 
     csv_file = open(csv_path, "w", encoding="utf-8")
     csv_file.write("seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp\n")
+    data_mode = "raw"  # will switch to "gyr_quat" if type 0x13 packets arrive
 
     def flush_reorder_buf():
         """Write contiguous samples from write_cursor onwards."""
@@ -249,10 +410,14 @@ def collect_hid(output_path, duration=None, device_index=None):
 
             if pkt_type == 0x10:
                 esb_len = 48
+            elif pkt_type == 0x13:
+                esb_len = 52
             elif pkt_type == 0x11:
                 esb_len = 16
             elif pkt_type == 0x12:
                 esb_len = 48
+            elif pkt_type == 0x14:
+                esb_len = 52
             else:
                 continue
 
@@ -263,18 +428,41 @@ def collect_hid(output_path, duration=None, device_index=None):
             if pkt_type == 0x12:  # Metadata
                 meta.parse(esb_payload)
                 print(f"\nMetadata received: {meta}")
-                with open(meta_path, "w", encoding="utf-8") as f:
-                    f.write(f"gyro_range_dps={meta.gyro_range}\n")
-                    f.write(f"accel_range_g={meta.accel_range}\n")
-                    f.write(f"gyro_odr_hz={meta.gyro_odr}\n")
-                    f.write(f"accel_odr_hz={meta.accel_odr}\n")
-                    f.write(f"mag_odr_hz={meta.mag_odr}\n")
-                    f.write(f"imu_id={meta.imu_id}\n")
-                    f.write(f"mag_id={meta.mag_id}\n")
-                    f.write("temp_source=tcal_float_c\n")
 
-            elif pkt_type == 0x10:  # Raw IMU
-                s = parse_raw_imu(esb_payload)
+            elif pkt_type == 0x14:  # Calibration data
+                cal.parse(esb_payload)
+                print(f"  Cal sub={esb_payload[2]} accel={cal.accel_BAinv is not None} mag={cal.mag_BAinv is not None} gyro={cal.gyro_bias is not None}")
+
+            elif pkt_type == 0x10 or pkt_type == 0x13:  # Raw IMU or gyrQuat
+                # Detect mode on first packet
+                if pkt_type == 0x13 and data_mode == "raw":
+                    data_mode = "gyr_quat"
+                    csv_file.close()
+                    csv_file = open(csv_path, "w", encoding="utf-8")
+                    csv_file.write("seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp\n")
+
+                # Write metadata file once on first IMU data arrival
+                if meta.received and not meta_written:
+                    meta_written = True
+                    with open(meta_path, "w", encoding="utf-8") as f:
+                        f.write(f"gyro_range_dps={meta.gyro_range}\n")
+                        f.write(f"accel_range_g={meta.accel_range}\n")
+                        f.write(f"gyro_odr_hz={meta.gyro_odr}\n")
+                        f.write(f"accel_odr_hz={meta.accel_odr}\n")
+                        f.write(f"mag_odr_hz={meta.mag_odr}\n")
+                        f.write(f"imu_id={meta.imu_id}\n")
+                        f.write(f"mag_id={meta.mag_id}\n")
+                        f.write("temp_source=tcal_float_c\n")
+                        f.write(f"data_mode={data_mode}\n")
+                        if cal.has_data:
+                            cal.write_to_file(f)
+                    print(f"  Metadata + calibration written to {meta_path}")
+
+                if pkt_type == 0x13:
+                    s = parse_raw_imu_quat(esb_payload)
+                else:
+                    s = parse_raw_imu(esb_payload)
+
                 if s:
                     seq = s["seq"]
 
@@ -296,13 +484,24 @@ def collect_hid(output_path, duration=None, device_index=None):
 
                     mag = s.get("mag") or (0.0, 0.0, 0.0)
                     temp = s.get("temp_c") or 0.0
-                    csv_line = (
-                        f"{seq},"
-                        f"{s['gyro'][0]:.6f},{s['gyro'][1]:.6f},{s['gyro'][2]:.6f},"
-                        f"{s['accel'][0]:.6f},{s['accel'][1]:.6f},{s['accel'][2]:.6f},"
-                        f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
-                        f"{temp:.6f}\n"
-                    )
+
+                    if data_mode == "gyr_quat":
+                        q = s["gyr_quat"]
+                        csv_line = (
+                            f"{seq},"
+                            f"{q[0]:.9f},{q[1]:.9f},{q[2]:.9f},{q[3]:.9f},"
+                            f"{s['accel'][0]:.6f},{s['accel'][1]:.6f},{s['accel'][2]:.6f},"
+                            f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
+                            f"{temp:.6f}\n"
+                        )
+                    else:
+                        csv_line = (
+                            f"{seq},"
+                            f"{s['gyro'][0]:.6f},{s['gyro'][1]:.6f},{s['gyro'][2]:.6f},"
+                            f"{s['accel'][0]:.6f},{s['accel'][1]:.6f},{s['accel'][2]:.6f},"
+                            f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
+                            f"{temp:.6f}\n"
+                        )
 
                     reorder_buf[seq] = csv_line
 
@@ -329,7 +528,7 @@ def collect_hid(output_path, duration=None, device_index=None):
             now = time.time()
             if now - last_status >= 2.0:
                 csv_file.flush()
-                elapsed = now - start_time
+                elapsed = now - (first_sample_time or start_time)
                 period = now - last_status
                 period_samples = sample_count - last_status_samples
                 rate = period_samples / period if period > 0 else 0
@@ -349,7 +548,7 @@ def collect_hid(output_path, duration=None, device_index=None):
                 last_status = now
                 last_status_samples = sample_count
 
-            if duration and (now - start_time >= duration):
+            if duration and first_sample_time and (now - first_sample_time >= duration):
                 break
 
     except KeyboardInterrupt:
@@ -361,19 +560,24 @@ def collect_hid(output_path, duration=None, device_index=None):
         csv_file.close()
         h.close()
 
-    elapsed = time.time() - start_time
-    data_duration = (time.time() - first_sample_time) if first_sample_time else elapsed
+    data_duration = (time.time() - first_sample_time) if first_sample_time else 0
     print(f"\n\nCollection complete:")
-    print(f"  Duration: {elapsed:.1f}s (data: {data_duration:.1f}s)")
+    print(f"  Duration: {data_duration:.1f}s")
     print(f"  Samples: {sample_count} -> {csv_path}")
     print(f"  Retransmits received: {retransmit_count}")
     total = sample_count + gap_count
     loss_pct = gap_count / total * 100 if total > 0 else 0
     print(f"  Gaps (lost): {gap_count} ({loss_pct:.2f}%)")
-    if meta.received:
+    if meta_written:
         with open(meta_path, "a", encoding="utf-8") as f:
+            # Final calibration write — ensures all late-arriving cal data is saved
+            if cal.has_data:
+                f.write(f"\n# Final calibration (complete)\n")
+                cal.write_to_file(f)
+            f.write(f"\n# Collection summary\n")
             f.write(f"duration_s={data_duration:.3f}\n")
             f.write(f"sample_count={sample_count}\n")
+            f.write(f"gap_count={gap_count}\n")
         print(f"  Metadata: {meta_path}")
 
 
