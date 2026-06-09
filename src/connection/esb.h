@@ -71,6 +71,7 @@
 #define ESB_PONG_FLAG_DFU_OTA 0x21       // Enter OTA DFU bootloader
 #define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
 #define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
+#define ESB_PONG_FLAG_SENS_AUTO 0x24        // Auto-calibrate gyro sensitivity
 #define ESB_PONG_FLAG_OTA_QUERY_INFO 0x30   // Request firmware info for ESB OTA
 #define ESB_PONG_FLAG_OTA_ABORT 0x31        // Abort ESB OTA update
 #define ESB_PONG_FLAG_OTA_SUPPRESS 0x32     // Suppress tracker during OTA (reduce poll rate)
@@ -124,6 +125,8 @@ uint32_t esb_get_stats_detailed_remaining(void); // Get remaining time (0 if no 
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag);
 void esb_send_remote_command_all(uint8_t command_flag);
 void esb_send_remote_command_sens(uint8_t tracker_id, float x, float y, float z);
+bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_t revolutions);
+uint8_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions);
 void esb_set_all_trackers_channel(uint8_t channel); // Set RF channel for all trackers
 void esb_clear_all_trackers_channel(void);          // Clear RF channel setting (restore default)
 
