@@ -125,6 +125,8 @@ static uint8_t packet_count[MAX_TRACKERS] = {0};             // Packet count rec
 static volatile uint8_t tracker_remote_command[MAX_TRACKERS]; // Command flag for next PONG
 static volatile uint32_t tracker_channel_value;               // Channel value for SET_CHANNEL command
 static volatile int16_t pending_sens_data[MAX_TRACKERS][3];   // SENS_SET sensitivity data
+static volatile uint8_t pending_sens_auto_axis[MAX_TRACKERS];
+static volatile uint16_t pending_sens_auto_revolutions[MAX_TRACKERS];
 static uint8_t receiver_rf_channel = 0xFF; // Current RF channel of the receiver, 0xFF indicates using default value
 
 #define PING_TIMEOUT_MS 5000 // PING timeout threshold: 5 seconds
@@ -1056,6 +1058,16 @@ static void esb_ack_handler_cb(const uint8_t *pdu_data, uint8_t data_length,
 			ack_payload->data[6] = (s1) & 0xFF;
 			ack_payload->data[8] = (s2 >> 8) & 0xFF;
 			ack_payload->data[9] = (s2) & 0xFF;
+			ack_payload->data[10] = 0;
+			ack_payload->data[11] = 0;
+		} else if (cmd == ESB_PONG_FLAG_SENS_AUTO) {
+			uint16_t rev = pending_sens_auto_revolutions[tracker_id];
+			ack_payload->data[3] = pending_sens_auto_axis[tracker_id];
+			ack_payload->data[4] = (rev >> 8) & 0xFF;
+			ack_payload->data[5] = (rev) & 0xFF;
+			ack_payload->data[6] = 0;
+			ack_payload->data[8] = 0;
+			ack_payload->data[9] = 0;
 			ack_payload->data[10] = 0;
 			ack_payload->data[11] = 0;
 		} else {
@@ -2297,6 +2309,71 @@ void esb_send_remote_command_sens(uint8_t tracker_id, float x, float y, float z)
 	LOG_INF("Queued SENS_SET for tracker %u: %.2f, %.2f, %.2f", tracker_id, (double)x, (double)y, (double)z);
 }
 
+bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_t revolutions)
+{
+	if (tracker_id >= MAX_TRACKERS) {
+		return false;
+	}
+
+	int64_t now = k_uptime_get();
+	k_mutex_lock(&tracker_store_lock, K_FOREVER);
+	bool active = tracker_id < stored_trackers && stored_tracker_addr[tracker_id] != 0 &&
+		      tracker_stats[tracker_id].last_packet_time > 0 &&
+		      now - tracker_stats[tracker_id].last_packet_time <= PING_TIMEOUT_MS;
+	if (!active) {
+		k_mutex_unlock(&tracker_store_lock);
+		LOG_WRN("SENS_AUTO not queued for inactive tracker %u", tracker_id);
+		return false;
+	}
+	pending_sens_auto_axis[tracker_id] = axis;
+	pending_sens_auto_revolutions[tracker_id] = revolutions;
+	tracker_remote_command[tracker_id] = ESB_PONG_FLAG_SENS_AUTO;
+	k_mutex_unlock(&tracker_store_lock);
+
+	if (revolutions == 0) {
+		LOG_INF("Queued SENS_AUTO for tracker %u: axis=%u, revolutions=default", tracker_id, axis);
+	} else {
+		LOG_INF("Queued SENS_AUTO for tracker %u: axis=%u, revolutions=%u", tracker_id, axis, revolutions);
+	}
+	return true;
+}
+
+uint8_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions)
+{
+	uint8_t count = 0;
+	int64_t scan_start_time = k_uptime_get();
+
+	k_msleep(REMOTE_COMMAND_ACTIVE_SCAN_MS);
+
+	k_mutex_lock(&tracker_store_lock, K_FOREVER);
+	for (uint8_t i = 0; i < stored_trackers && i < MAX_TRACKERS; i++) {
+		if (stored_tracker_addr[i] != 0 && tracker_stats[i].last_packet_time >= scan_start_time) {
+			pending_sens_auto_axis[i] = axis;
+			pending_sens_auto_revolutions[i] = revolutions;
+			tracker_remote_command[i] = ESB_PONG_FLAG_SENS_AUTO;
+			count++;
+		}
+	}
+	k_mutex_unlock(&tracker_store_lock);
+
+	if (revolutions == 0) {
+		LOG_INF(
+			"Queued SENS_AUTO for %u active trackers: axis=%u, revolutions=default",
+			count,
+			axis
+		);
+	} else {
+		LOG_INF(
+			"Queued SENS_AUTO for %u active trackers: axis=%u, revolutions=%u",
+			count,
+			axis,
+			revolutions
+		);
+	}
+
+	return count;
+}
+
 void esb_send_remote_command_channel(uint8_t tracker_id, uint8_t channel)
 {
 	if (tracker_id < MAX_TRACKERS) {
@@ -2369,6 +2446,9 @@ void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag)
 			break;
 		case ESB_PONG_FLAG_SENS_RESET:
 			cmd_name = "SENS_RESET";
+			break;
+		case ESB_PONG_FLAG_SENS_AUTO:
+			cmd_name = "SENS_AUTO";
 			break;
 		case ESB_PONG_FLAG_RESET_ZRO:
 			cmd_name = "RESET_ZRO";
@@ -2502,6 +2582,9 @@ void esb_send_remote_command_all(uint8_t command_flag)
 		break;
 	case ESB_PONG_FLAG_SENS_RESET:
 		cmd_name = "SENS_RESET";
+		break;
+	case ESB_PONG_FLAG_SENS_AUTO:
+		cmd_name = "SENS_AUTO";
 		break;
 	case ESB_PONG_FLAG_RESET_ZRO:
 		cmd_name = "RESET_ZRO";

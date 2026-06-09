@@ -56,6 +56,7 @@ K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, 6, 0,
 #define NRF5_BOOTLOADER CONFIG_BOARD_HAS_NRF5_BOOTLOADER
 #define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
 #define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
+#define SENS_AUTO_MAX_REVOLUTIONS 100
 
 #if NRF5_BOOTLOADER
 static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
@@ -200,7 +201,8 @@ static void print_help(void)
 		"    Commands: shutdown, calibrate, 6-side, meow, scan,\n"
 		"              mag <on|off|clear|cal>, reboot, clear, dfu [ota],\n"
 		"              channel <1-100>, clearchannel,\n"
-		"              sens <x,y,z|reset>, reset <zro|acc|bat|mag|tcal|fusion>, ping\n"
+		"              sens <x,y,z|reset|auto <x|y|z> [rev]>,\n"
+		"              reset <zro|acc|bat|mag|tcal|fusion>, ping\n"
 	);
 
 	printk(
@@ -210,6 +212,7 @@ static void print_help(void)
 		"      send 1 meow              Make tracker 1 meow\n"
 		"      send 2 reboot            Reboot tracker 2\n"
 		"      send 0 sens 1.0,1.0,1.0  Set sensitivity for tracker 0\n"
+		"      send 0 sens auto z       Auto-calibrate Z sensitivity on tracker 0\n"
 		"      send all sens reset      Reset sensitivity for all\n"
 		"      send 1 reset zro         Reset ZRO calibration on tracker 1\n"
 		"      send all ping            Ping all active trackers\n"
@@ -670,9 +673,12 @@ static void console_thread(void)
 				} else if (strcmp(arg2, "sens") == 0) {
 					// sens command - needs arg3 for values or "reset"
 					if (!arg3) {
-						printk("Usage: send <id|all> sens <x>,<y>,<z> or send <id|all> sens reset\n");
+						printk("Usage: send <id|all> sens <x>,<y>,<z>\n");
+						printk("Usage: send <id|all> sens reset\n");
+						printk("Usage: send <id|all> sens auto <x|y|z> [revolutions]\n");
 						printk("Example: send 0 sens 1.0,1.0,1.0\n");
 						printk("Example: send all sens reset\n");
+						printk("Example: send 0 sens auto z 5\n");
 						continue;
 					}
 
@@ -684,6 +690,84 @@ static void console_thread(void)
 						} else {
 							esb_send_remote_command(tracker_id, ESB_PONG_FLAG_SENS_RESET);
 							printk("Sens reset request sent to tracker %d\n", tracker_id);
+						}
+					} else if (strcmp(arg3, "auto") == 0) {
+						if (!arg4 || arg4[0] == '\0') {
+							printk("Usage: send <id|all> sens auto <x|y|z> [revolutions]\n");
+							continue;
+						}
+
+						char *rev_str = NULL;
+						if (arg4[1] == ' ') {
+							arg4[1] = '\0';
+							rev_str = (char *)arg4 + 2;
+							while (*rev_str == ' ') {
+								rev_str++;
+							}
+						} else if (arg4[1] != '\0') {
+							printk("Usage: send <id|all> sens auto <x|y|z> [revolutions]\n");
+							continue;
+						}
+
+						uint8_t axis;
+						if (arg4[0] == 'x') {
+							axis = 0;
+						} else if (arg4[0] == 'y') {
+							axis = 1;
+						} else if (arg4[0] == 'z') {
+							axis = 2;
+						} else {
+							printk("Invalid axis '%s'. Use x, y, or z.\n", arg4);
+							continue;
+						}
+
+						uint16_t revolutions = 0;
+						if (rev_str && *rev_str) {
+							char *endptr;
+							long value = strtol(rev_str, &endptr, 10);
+							if (*endptr != '\0' || value < 1 || value > SENS_AUTO_MAX_REVOLUTIONS) {
+								printk("Invalid revolutions '%s'. Use 1 to %u.\n", rev_str, SENS_AUTO_MAX_REVOLUTIONS);
+								continue;
+							}
+							revolutions = (uint16_t)value;
+						}
+
+						if (target_all) {
+							uint8_t count = esb_send_remote_command_sens_auto_all(axis, revolutions);
+							if (revolutions == 0) {
+								printk(
+									"Sens auto request sent to %u active tracker%s on %c axis using tracker default rev\n",
+									count,
+									count == 1 ? "" : "s",
+									'x' + axis
+								);
+							} else {
+								printk(
+									"Sens auto request sent to %u active tracker%s on %c axis for %u rev\n",
+									count,
+									count == 1 ? "" : "s",
+									'x' + axis,
+									revolutions
+								);
+							}
+						} else {
+							bool queued = esb_send_remote_command_sens_auto(tracker_id, axis, revolutions);
+							if (!queued) {
+								printk("Sens auto request not queued: tracker %d is not active\n", tracker_id);
+							} else if (revolutions == 0) {
+								printk(
+									"Sens auto request sent to tracker %d on %c axis using tracker default rev\n",
+									tracker_id,
+									'x' + axis
+								);
+							} else {
+								printk(
+									"Sens auto request sent to tracker %d on %c axis for %u rev\n",
+									tracker_id,
+									'x' + axis,
+									revolutions
+								);
+							}
 						}
 					} else {
 						// Parse comma-separated floats
