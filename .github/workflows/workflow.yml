@@ -201,6 +201,8 @@ jobs:
                   {boardname: "nrf52840dongle/nrf52840", filename: "SlimeNRF_Nordic_eByte_Dongle_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "holyiot_21017/nrf52840", filename: "SlimeNRF_Holyiot_Dongle_Receiver"},
                   {boardname: "holyiot_21017/nrf52840", filename: "SlimeNRF_Holyiot_Dongle_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
+                  {boardname: "holyiot_22046/nrf52840", filename: "SlimeNRF_Holyiot_22046_Dongle_Receiver"},
+                  {boardname: "holyiot_22046/nrf52840", filename: "SlimeNRF_Holyiot_22046_Dongle_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "promicro_uf2/nrf52840", filename: "SlimeNRF_ProMicro_Receiver"},
                   {boardname: "promicro_uf2/nrf52840", filename: "SlimeNRF_ProMicro_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "xiao_ble/nrf52840", filename: "SlimeNRF_XIAO_Receiver"},
