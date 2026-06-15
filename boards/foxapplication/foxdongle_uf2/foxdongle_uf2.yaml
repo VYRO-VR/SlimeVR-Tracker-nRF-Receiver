@@ -1,8 +1,8 @@
 # Copyright (c) 2024 Nordic Semiconductor ASA
 # SPDX-License-Identifier: Apache-2.0
 
-identifier: foxdongle_npa_uf2
-name: foxdongle_npa_uf2
+identifier: foxdongle_uf2
+name: foxdongle_uf2
 vendor: foxapplication
 type: mcu
 arch: arm
@@ -12,3 +12,13 @@ toolchain:
   - zephyr
   - gnuarmemb
   - xtools
+supported:
+  - adc
+  - usb_device
+  - ble
+  - pwm
+  - spi
+  - watchdog
+  - counter
+  - netif:openthread
+  - gpio
