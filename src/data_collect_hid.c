@@ -22,7 +22,7 @@
 */
 
 /*
- * Data collection via dedicated HID endpoint (HID_1).
+ * Data collection via dedicated HID endpoint.
  *
  * Each raw ESB packet is forwarded as a single 64-byte HID input report:
  *   [0..N-1]  ESB payload (up to 52 bytes: 48 for type 0x10, 52 for type 0x13)
@@ -34,14 +34,15 @@
  * The PC reads from the second HID interface of the same USB device.
  */
 
-#include "globals.h"
 #include "data_collect.h"
 #include "connection/esb.h"
 
+#include <stddef.h>
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/usb/usb_device.h>
-#include <zephyr/usb/class/usb_hid.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/usb/class/usbd_hid.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/logging/log.h>
 
@@ -51,7 +52,7 @@ LOG_MODULE_REGISTER(data_collect, LOG_LEVEL_INF);
  * Vendor-defined usage page to avoid conflicts with standard HID drivers. */
 static const uint8_t dc_hid_report_desc[] = {
 	0x06, 0x00, 0xFF,                           /* Usage Page (Vendor Defined 0xFF00) */
-	HID_USAGE(0x01),                            /* Vendor usage 0x01 */
+	HID_USAGE(0x01),
 	HID_COLLECTION(HID_COLLECTION_APPLICATION),
 		HID_USAGE(0x01),
 		HID_REPORT_SIZE(8),
@@ -60,18 +61,24 @@ static const uint8_t dc_hid_report_desc[] = {
 	HID_END_COLLECTION,
 };
 
+#define DC_HID_NODE DT_NODELABEL(hid_dev_1)
+#define DC_REPORT_SIZE 64U
+#define DC_FIFO_SIZE 64U
+#define DC_STATS_INTERVAL_MS 3000
+
 /* Device and state */
 static const struct device *dc_hdev;
 static ATOMIC_DEFINE(dc_ep_busy, 1);
+static bool dc_hid_ready;
+static const uint8_t *dc_submitted_report;
 #define DC_EP_BUSY_FLAG 0
 
 /* Report FIFO: ISR writes here, work handler reads.
- * hid_int_ep_write() is NOT safe from ISR context (event_handler),
+ * hid_device_submit_report() is NOT safe from ISR context (event_handler),
  * so we buffer reports and process them in the system work queue.
  * 64 slots × 64 bytes = 4 KB; at 400 Hz input rate this provides
  * ~160 ms of buffering against transient USB stalls. */
-#define DC_FIFO_SIZE 64
-static uint8_t dc_fifo[DC_FIFO_SIZE][64];
+static uint8_t dc_fifo[DC_FIFO_SIZE][DC_REPORT_SIZE] __aligned(sizeof(void *));
 static atomic_t dc_fifo_write;
 static atomic_t dc_fifo_read;
 static struct k_work dc_send_work;
@@ -93,11 +100,37 @@ static uint32_t dc_last_stats_sent;
 static uint32_t dc_last_stats_dropped;
 static uint32_t dc_last_stats_received;
 
+static size_t dc_fifo_next(size_t index)
+{
+	index++;
+	return (index >= DC_FIFO_SIZE) ? 0U : index;
+}
+
+static bool dc_fifo_empty(void)
+{
+	return atomic_get(&dc_fifo_read) == atomic_get(&dc_fifo_write);
+}
+
+static void dc_fifo_advance_read(void)
+{
+	size_t rd = (size_t)atomic_get(&dc_fifo_read);
+
+	atomic_set(&dc_fifo_read, (atomic_val_t)dc_fifo_next(rd));
+}
+
+static void dc_drop_current_report(void)
+{
+	if (!dc_fifo_empty()) {
+		dc_fifo_advance_read();
+		dc_frames_dropped++;
+	}
+}
+
 /* Work handler: send buffered reports from thread context */
 static void dc_send_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	if (!dc_hdev) return;
+	if (!dc_hdev || !dc_hid_ready) return;
 
 	while (1) {
 		size_t rd = (size_t)atomic_get(&dc_fifo_read);
@@ -106,36 +139,86 @@ static void dc_send_work_handler(struct k_work *work)
 
 		/* Wait for endpoint to be free */
 		if (atomic_test_and_set_bit(dc_ep_busy, DC_EP_BUSY_FLAG)) {
-			/* Endpoint busy — will be rescheduled by int_in_ready_cb */
 			break;
 		}
 
-		int wrote;
-		int ret = hid_int_ep_write(dc_hdev, dc_fifo[rd], 64, &wrote);
-		if (ret != 0) {
-			atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
-			dc_frames_dropped++;
-		} else {
-			dc_frames_sent++;
+		dc_submitted_report = dc_fifo[rd];
+		int ret = hid_device_submit_report(dc_hdev, DC_REPORT_SIZE, dc_fifo[rd]);
+		if (ret == 0) {
+			break;
 		}
 
-		size_t next = rd + 1;
-		if (next >= DC_FIFO_SIZE) next = 0;
-		atomic_set(&dc_fifo_read, next);
+		dc_submitted_report = NULL;
+		if (ret == -EACCES) {
+			atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
+			break;
+		}
+
+		dc_drop_current_report();
+		atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
+		break;
 	}
 }
 
-/* Endpoint callbacks */
-static void dc_int_in_ready_cb(const struct device *dev)
+static void dc_iface_ready_cb(const struct device *dev, const bool ready)
 {
-	ARG_UNUSED(dev);
+	if (dev != dc_hdev) {
+		return;
+	}
+
+	dc_hid_ready = ready;
+	if (!ready) {
+		dc_submitted_report = NULL;
+	}
+
 	atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
-	/* Reschedule work to send next buffered report */
+	if (ready) {
+		k_work_submit(&dc_send_work);
+	}
+}
+
+static int dc_get_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
+			    const uint16_t len, uint8_t *const buf)
+{
+	if (dev != dc_hdev) {
+		return -ENODEV;
+	}
+
+	if (type != HID_REPORT_TYPE_INPUT || id != 0U) {
+		return -ENOTSUP;
+	}
+
+	if (len < DC_REPORT_SIZE || buf == NULL) {
+		return -EINVAL;
+	}
+
+	memset(buf, 0, DC_REPORT_SIZE);
+	return DC_REPORT_SIZE;
+}
+
+static void dc_input_report_done_cb(const struct device *dev,
+				    const uint8_t *const submitted_report)
+{
+	if (dev != dc_hdev) {
+		return;
+	}
+
+	if (submitted_report == dc_submitted_report) {
+		dc_fifo_advance_read();
+		dc_frames_sent++;
+		dc_submitted_report = NULL;
+	} else {
+		LOG_WRN("Data HID completion for stale report buffer");
+	}
+
+	atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
 	k_work_submit(&dc_send_work);
 }
 
-static const struct hid_ops dc_hid_ops = {
-	.int_in_ready = dc_int_in_ready_cb,
+static const struct hid_device_ops dc_hid_ops = {
+	.iface_ready = dc_iface_ready_cb,
+	.get_report = dc_get_report_cb,
+	.input_report_done = dc_input_report_done_cb,
 };
 
 /* Timeout work: stop collection and notify tracker (runs in workqueue context) */
@@ -169,22 +252,16 @@ int data_collect_init(void)
 	/* Start periodic timeout check (1 second interval) */
 	k_timer_start(&dc_timeout_timer, K_SECONDS(1), K_SECONDS(1));
 
-	dc_hdev = device_get_binding("HID_1");
-	if (dc_hdev == NULL) {
-		LOG_ERR("Cannot get HID_1 device for data collection");
+	dc_hdev = DEVICE_DT_GET(DC_HID_NODE);
+	if (!device_is_ready(dc_hdev)) {
+		LOG_ERR("Cannot get data collection HID device");
 		return -ENODEV;
 	}
 
-	usb_hid_register_device(dc_hdev, dc_hid_report_desc,
-				sizeof(dc_hid_report_desc), &dc_hid_ops);
-
-	if (usb_hid_set_proto_code(dc_hdev, HID_BOOT_IFACE_CODE_NONE)) {
-		LOG_WRN("Failed to set HID_1 Protocol Code");
-	}
-
-	int ret = usb_hid_init(dc_hdev);
+	int ret = hid_device_register(dc_hdev, dc_hid_report_desc,
+				      sizeof(dc_hid_report_desc), &dc_hid_ops);
 	if (ret) {
-		LOG_ERR("Failed to init HID_1: %d", ret);
+		LOG_ERR("Failed to register data collection HID device: %d", ret);
 		return ret;
 	}
 
@@ -192,7 +269,7 @@ int data_collect_init(void)
 	dc_frames_sent = 0;
 	dc_frames_dropped = 0;
 
-	LOG_INF("Data collection HID endpoint initialized (HID_1)");
+	LOG_INF("Data collection HID endpoint initialized");
 	return 0;
 }
 
@@ -207,7 +284,7 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 
 	/* Periodic stats (every 3 seconds) */
 	int64_t now = k_uptime_get();
-	if (now - dc_last_stats_time >= 3000) {
+	if (now - dc_last_stats_time >= DC_STATS_INTERVAL_MS) {
 		uint32_t period_sent = dc_frames_sent - dc_last_stats_sent;
 		uint32_t period_dropped = dc_frames_dropped - dc_last_stats_dropped;
 		uint32_t period_received = dc_frames_received - dc_last_stats_received;
@@ -220,10 +297,14 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 		dc_last_stats_received = dc_frames_received;
 	}
 
+	if (!dc_hid_ready) {
+		dc_frames_dropped++;
+		return;
+	}
+
 	/* FIFO full check */
 	size_t wr = (size_t)atomic_get(&dc_fifo_write);
-	size_t next = wr + 1;
-	if (next >= DC_FIFO_SIZE) next = 0;
+	size_t next = dc_fifo_next(wr);
 	if (next == (size_t)atomic_get(&dc_fifo_read)) {
 		dc_frames_dropped++;
 		return;
@@ -231,7 +312,7 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 
 	/* Build 64-byte HID report in FIFO slot */
 	uint8_t *report = dc_fifo[wr];
-	memset(report, 0, 64);
+	memset(report, 0, DC_REPORT_SIZE);
 
 	/* Allow up to 52 bytes for type 0x13 (gyrQuat) packets */
 	uint8_t copy_len = (len > 52) ? 52 : len;
@@ -243,7 +324,7 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 	uint32_t rx_ticks = (uint32_t)k_uptime_ticks();
 	sys_put_be32(rx_ticks, &report[pos]);
 
-	atomic_set(&dc_fifo_write, next);
+	atomic_set(&dc_fifo_write, (atomic_val_t)next);
 
 	/* Schedule deferred send (ISR-safe) */
 	k_work_submit(&dc_send_work);
@@ -264,8 +345,12 @@ void data_collect_start(uint8_t tracker_id)
 	/* Reset FIFO */
 	atomic_set(&dc_fifo_write, 0);
 	atomic_set(&dc_fifo_read, 0);
+	dc_submitted_report = NULL;
 	/* Clear busy flag to ensure endpoint is ready */
 	atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
+	if (dc_hid_ready) {
+		k_work_submit(&dc_send_work);
+	}
 	LOG_INF("Data collection STARTED for tracker %u (HID)", tracker_id);
 }
 

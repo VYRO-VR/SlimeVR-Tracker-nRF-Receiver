@@ -265,7 +265,7 @@ static void button_thread(void)
 			case 1: // Shutdown all active trackers
 				LOG_INF("Shutdown all trackers requested");
 				esb_request_all_shutdown();
-				set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
+				set_led(SYS_LED_PATTERN_ONESHOT_SHUTDOWN_ACK, SYS_LED_PRIORITY_HIGHEST);
 				break;
 
 			case 2: // Exit pairing mode

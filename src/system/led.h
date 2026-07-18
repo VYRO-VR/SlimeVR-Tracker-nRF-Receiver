@@ -40,10 +40,11 @@ enum sys_led_pattern {
 	SYS_LED_PATTERN_LONG, // 500ms on 500ms off										// Default | indicates waiting
 	SYS_LED_PATTERN_FLASH, // 200ms on 200ms off									// Default | indicates readiness
 
-	SYS_LED_PATTERN_ONESHOT_POWERON, // 200ms on 200ms off, 3 times					// Default
+	SYS_LED_PATTERN_ONESHOT_POWERON, // 200ms on 200ms off, 3 times				// Default
 	SYS_LED_PATTERN_ONESHOT_POWEROFF, // 250ms off, 1000ms fade to off				// Default
 	SYS_LED_PATTERN_ONESHOT_PROGRESS, // 200ms on 200ms off, 2 times				// Success
 	SYS_LED_PATTERN_ONESHOT_COMPLETE, // 200ms on 200ms off, 4 times				// Success
+	SYS_LED_PATTERN_ONESHOT_SHUTDOWN_ACK, // 500ms on/off x2					// Default | remote shutdown trackers ack
 
 	SYS_LED_PATTERN_ON_PERSIST, // 20% duty cycle									// Success | indicates charged
 	SYS_LED_PATTERN_LONG_PERSIST, // 20% duty cycle, 500ms on 500ms off				// Charging| indicates low battery

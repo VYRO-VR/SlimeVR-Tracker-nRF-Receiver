@@ -96,4 +96,35 @@ config DATA_COLLECT_HID
         When enabled, raw data is sent via a dedicated HID endpoint.
         When disabled, raw data is sent via a second CDC ACM serial port.
 
+config SLIMEVR_USB_DEVICE_VID
+    hex "SlimeVR USB vendor ID"
+    default 0x1209
+    help
+        USB vendor ID used by the SlimeVR USBD_NEXT device.
+
+config SLIMEVR_USB_DEVICE_PID
+    hex "SlimeVR USB product ID"
+    default 0x7690
+    help
+        USB product ID used by the SlimeVR receiver firmware.
+
+config SLIMEVR_USB_DEVICE_MANUFACTURER
+    string "SlimeVR USB manufacturer"
+    default "SlimeVR"
+    help
+        USB manufacturer string and console banner prefix.
+
+config SLIMEVR_USB_DEVICE_PRODUCT
+    string "SlimeVR USB product"
+    default "SlimeNRF Receiver"
+    help
+        USB product string and console banner name.
+
+config SLIMEVR_USB_DEVICE_MAX_POWER
+    int "SlimeVR USB max power"
+    range 0 250
+    default 100
+    help
+        USB bMaxPower value in 2 mA units.
+
 source "Kconfig.zephyr"

@@ -343,6 +343,14 @@ static void led_thread(void)
 			else
 				k_msleep(200);
 			break;
+		case SYS_LED_PATTERN_ONESHOT_SHUTDOWN_ACK:
+			led_pattern_state++;
+			led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, !(led_pattern_state % 2) * 10000);
+			if (led_pattern_state == 5)
+				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
+			else
+				k_msleep(500);
+			break;
 		case SYS_LED_PATTERN_ONESHOT_COMPLETE:
 			led_pattern_state++;
 			led_pin_set(SYS_LED_COLOR_SUCCESS, 10000, !(led_pattern_state % 2) * 10000);

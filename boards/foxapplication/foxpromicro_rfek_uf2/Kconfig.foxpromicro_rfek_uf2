@@ -1,10 +1,10 @@
 # Copyright (c) 2024 Nordic Semiconductor ASA
 # SPDX-License-Identifier: Apache-2.0
 
-config BOARD_FOXDONGLE_UF2
+config BOARD_FOXPROMICRO_RFEK_UF2
 	select SOC_NRF52840_QIAA
 
-if BOARD_FOXDONGLE_UF2
+if BOARD_FOXPROMICRO_RFEK_UF2
 
 config BOARD_SERIAL_BACKEND_CDC_ACM
 	bool "USB CDC"
@@ -34,4 +34,4 @@ config MPSL_FEM_GENERIC_TWO_CTRL_PINS_SUPPORT
     default y
 
 
-endif # BOARD_FOXDONGLE_UF2
+endif # BOARD_FOXPROMICRO_RFEK_UF2
