@@ -28,30 +28,10 @@
 
 #ifdef CONFIG_DATA_COLLECT
 
-/*
- * Data collection via dedicated HID endpoint (HID_1).
- *
- * Each raw ESB packet is forwarded as a single 64-byte HID input report:
- *   [0..N-1]    ESB payload (up to 48 bytes, same format as over-the-air)
- *   [N]         RSSI
- *   [N+1..N+4]  rx_ticks (BE32, Zephyr uptime ticks)
- *   [N+5..63]   zero padding
- *
- * No framing protocol needed — HID guarantees packet boundaries.
- * The PC reads from the second HID interface (vendor usage page 0xFF00).
- *
- * Payload types (byte 0):
- *   - Type 0x10 (RAW_IMU):  48 bytes, with full-precision T-Cal temp at
- *                           bytes 41-44
- *   - Type 0x11 (RAW_MAG):  up to 17 bytes
- *   - Type 0x12 (RAW_META): 48 bytes
- */
-
-/* Initialize data collection HID endpoint */
 int data_collect_init(void);
 
-/* Write a raw data packet as a HID report.
- * Called from ESB event handler when a raw packet (0x10-0x12) arrives.
+/* Write a raw data packet.
+ * Called from ESB event handler when a raw packet arrives.
  * data: raw ESB payload, len: payload length, rssi: received signal strength */
 void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi);
 

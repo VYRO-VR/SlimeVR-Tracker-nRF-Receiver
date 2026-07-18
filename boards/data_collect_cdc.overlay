@@ -1,6 +1,8 @@
-/* CDC ACM interface for data collection (serial mode) */
-&usbd {
+&zephyr_udc0 {
 	cdc_acm_uart1: cdc_acm_uart1 {
 		compatible = "zephyr,cdc-acm-uart";
+		label = "SlimeNRF Raw Data CDC";
+		tx-fifo-size = <4096>;
+		rx-fifo-size = <64>;
 	};
 };

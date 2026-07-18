@@ -98,9 +98,9 @@ static void request_local_dfu(bool ota)
 
 static void print_info(void)
 {
-	printk(CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT "\n");
+	printk(CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT "\n");
 	printk(FW_STRING);
-	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
 
 	printk("\nBoard: " CONFIG_BOARD "\n");
 	printk("SOC: " CONFIG_SOC "\n");
@@ -250,7 +250,7 @@ static void print_help(void)
 
 	printk(
 		"Button Functions:\n"
-		"  Short press (1x):          Status check\n"
+		"  Short press (1x):          Shutdown all paired trackers (LED double blink)\n"
 		"  Quick press (2x):          Exit pairing mode\n"
 		"  Quick press (3x):          Enter pairing mode\n"
 		"  Long press (5s):           Clear all pairings\n"
@@ -314,12 +314,11 @@ static void console_thread(void)
 		k_msleep(100);
 	}
 
-	printk("*** " CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT " ***\n");
+	printk("*** " CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT " ***\n");
 	printk(FW_STRING);
-	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
 
-	// Print help on startup
-	print_help();
+	printk("Type 'help' to show available commands.\n");
 
 	uint8_t command_info[] = "info";
 	uint8_t command_uptime[] = "uptime";

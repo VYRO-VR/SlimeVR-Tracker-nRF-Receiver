@@ -25,14 +25,13 @@
 #include "connection/esb.h"
 #include "esb_ota.h"
 #include "receiver_ota.h"
+#include "usb.h"
 
 #include <limits.h>
 #include <zephyr/kernel.h>
-#include <zephyr/usb/usb_device.h>
-#include <zephyr/usb/class/usb_hid.h>
+#include <zephyr/usb/class/usbd_hid.h>
 
 static struct k_work report_send;
-static struct k_work report_read;
 
 static struct tracker_report {
 	uint8_t data[16];
@@ -49,18 +48,16 @@ atomic_t report_read_index = 0;
 // read_index == write_index -> empty fifo
 // (write_index + 1) % MAX_REPORTS == read_index -> full fifo
 
-static bool configured;
 static const struct device *hdev;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
-static ATOMIC_DEFINE(hid_ep_out_busy, 1);
+static bool hid_ready;
+static uint32_t hid_idle_duration_ms;
 
 #define HID_EP_BUSY_FLAG	0
 #define REPORT_PERIOD		K_MSEC(1) // streaming reports
-#define POLL_PERIOD		K_MSEC(1)
 #define HID_EP_REPORT_COUNT 4
 #define HID_TPS_UPDATE_INTERVAL_MS 1000
 #define HID_STATS_POLL_INTERVAL_MS 200
-#define USB_EP_TIMEOUT_MS 100  // USB endpoint timeout threshold
 
 // EMA平滑因子配置
 // alpha = RSSI_EMA_ALPHA / 256
@@ -68,8 +65,7 @@ static ATOMIC_DEFINE(hid_ep_out_busy, 1);
 // alpha越小，平滑效果越强但响应越慢
 #define RSSI_EMA_ALPHA 51  // 范围: 1-255, 推荐值: 26-77 (0.1-0.3)
 
-struct tracker_report ep_report_buffer[HID_EP_REPORT_COUNT];
-static uint8_t ep_read_buffer[256];
+struct tracker_report ep_report_buffer[HID_EP_REPORT_COUNT] __aligned(sizeof(void *));
 
 // RSSI EMA平滑处理结构
 struct rssi_ema_state {
@@ -116,7 +112,6 @@ static const uint8_t hid_report_desc[] = {
 };
 
 uint16_t sent_device_addr = 0;
-bool usb_enabled = false;
 int64_t last_registration_sent = 0;
 
 //|type    |description
@@ -203,38 +198,13 @@ static uint32_t hid_stats_snapshot(bool *had_activity)
 
 static uint32_t dropped_reports = 0;
 static uint16_t max_dropped_reports = 0;
-static int64_t last_ep_busy_time = 0;  // Track USB endpoint busy time for timeout detection
-static int64_t ep_cooldown_until = 0;  // After stuck reset, wait before retrying
 
 static void send_report(struct k_work *work)
 {
-	if (!usb_enabled) return;
-	if (!configured) return;  // Don't send reports until USB is configured
+	if (!receiver_usb_is_enabled()) return;
+	if (!receiver_usb_is_configured()) return;
+	if (!hid_ready) return;
 	if (!stored_trackers) return;
-
-	// After a stuck reset, wait for cooldown before retrying
-	if (ep_cooldown_until > 0) {
-		if (k_uptime_get() < ep_cooldown_until) {
-			return;
-		}
-		ep_cooldown_until = 0;
-	}
-
-	// Check if USB endpoint is stuck
-	if (atomic_test_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
-		int64_t now = k_uptime_get();
-		if (last_ep_busy_time == 0) {
-			last_ep_busy_time = now;
-		} else if (now - last_ep_busy_time > USB_EP_TIMEOUT_MS) {
-			LOG_WRN("USB endpoint stuck for %lld ms, forcing reset", now - last_ep_busy_time);
-			atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
-			last_ep_busy_time = 0;
-			ep_cooldown_until = now + 50;  // 50ms cooldown for USB to settle
-			return;
-		}
-	} else {
-		last_ep_busy_time = 0;
-	}
 
 	// Get current FIFO status atomically
 	size_t write_idx = (size_t)atomic_get(&report_write_index);
@@ -244,29 +214,23 @@ static void send_report(struct k_work *work)
 		return; // send registrations only every 100ms
 	}
 
-	int ret, wrote;
-
-	last_registration_sent = k_uptime_get();
+	int ret;
 
 	if (!atomic_test_and_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
 		// Calculate how many reports we have available
 		int available_reports = write_idx - read_idx;
 		if (available_reports < 0) available_reports += MAX_REPORTS;
 		size_t reports_to_send = (size_t) MIN(available_reports, HID_EP_REPORT_COUNT);
+		size_t next_read_idx = read_idx;
 
 		int epind;
 		// Copy existing data to buffer
 		for (epind = 0; epind < reports_to_send; epind++) {
-			ep_report_buffer[epind] = reports[read_idx];
-			read_idx++;
-			if (read_idx == MAX_REPORTS) {
-				read_idx = 0;
+			ep_report_buffer[epind] = reports[next_read_idx];
+			next_read_idx++;
+			if (next_read_idx == MAX_REPORTS) {
+				next_read_idx = 0;
 			}
-		}
-
-		if (reports_to_send > 0U) {
-			atomic_set(&report_read_index, read_idx);
-			hid_stats_record_reports((uint32_t)reports_to_send);
 		}
 
 		// Pad remaining report slots with device addr
@@ -277,23 +241,23 @@ static void send_report(struct k_work *work)
 			}
 		}
 
-		ret = hid_int_ep_write(hdev, (uint8_t *)ep_report_buffer, sizeof(report) * HID_EP_REPORT_COUNT, &wrote);
+		ret = hid_device_submit_report(hdev, sizeof(report) * HID_EP_REPORT_COUNT,
+					       (uint8_t *)ep_report_buffer);
 
 		if (ret != 0) {
-			/*
-			 * Write failed — clear the busy flag immediately so the
-			 * next timer cycle can attempt to send again.  Without
-			 * this, the flag stays set until the 100 ms stuck timeout
-			 * because the completion callback never fires on error.
-			 */
 			atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
 			static int64_t last_err_log;
 			int64_t now = k_uptime_get();
-			if (now - last_err_log > 5000) {
-				LOG_ERR("Failed to submit report");
+			if (ret != -EACCES && now - last_err_log > 5000) {
+				LOG_ERR("Failed to submit report: %d", ret);
 				last_err_log = now;
 			}
 		} else {
+			last_registration_sent = k_uptime_get();
+			if (reports_to_send > 0U) {
+				atomic_set(&report_read_index, (atomic_val_t)next_read_idx);
+				hid_stats_record_reports((uint32_t)reports_to_send);
+			}
 			//LOG_DBG("Report submitted");
 		}
 	} else { // busy with what
@@ -394,158 +358,177 @@ void hid_reset_all_rssi_smooth(void)
 
 K_THREAD_DEFINE(hid_dropped_reports_logging_thread, 256, hid_dropped_reports_logging, NULL, NULL, NULL, 7, 0, 0);
 
-static void read_report(struct k_work *work)
+static void handle_output_report(const uint8_t *buf, uint16_t len)
 {
-	ARG_UNUSED(work);
-
-	if (!usb_enabled || !configured) {
+	if (len == 0) {
 		return;
 	}
 
-	int ret;
-	int read = 0;
-
-	if (!atomic_test_and_set_bit(hid_ep_out_busy, HID_EP_BUSY_FLAG)) {
-		ret = hid_int_ep_read(hdev, ep_read_buffer, sizeof(ep_read_buffer), &read);
-		if (ret != 0) {
-			LOG_ERR("hid_int_ep_read: %d", ret);
-		} else if (read > 0) {
-			/* Dispatch HID OUT reports */
-			uint8_t report_type = ep_read_buffer[0];
-			if (report_type >= 0xF0 && report_type <= 0xF7) {
-				if (read >= 2 && ep_read_buffer[1] == RECEIVER_OTA_ID) {
-					/* Receiver self-OTA */
-					receiver_ota_process_hid(ep_read_buffer, read);
-				} else {
-					/* Tracker relay OTA */
-					esb_ota_relay_process_hid(ep_read_buffer, read);
-				}
-			}
+	uint8_t report_type = buf[0];
+	if (report_type >= 0xF0 && report_type <= 0xF7) {
+		if (len >= 2 && buf[1] == RECEIVER_OTA_ID) {
+			receiver_ota_process_hid(buf, len);
+		} else {
+			esb_ota_relay_process_hid(buf, len);
 		}
 	}
 }
 
 static void int_in_ready_cb(const struct device *dev)
 {
-	ARG_UNUSED(dev);
+	if (dev != hdev) {
+		return;
+	}
+
 	if (!atomic_test_and_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
-		// During cooldown after stuck reset, stale callbacks are expected
-		if (ep_cooldown_until == 0) {
+		if (receiver_usb_is_configured() && hid_ready) {
 			LOG_WRN("IN endpoint callback without preceding buffer write");
 		}
 	}
 }
 
-static void int_out_ready_cb(const struct device *dev)
+static void input_report_done_cb(const struct device *dev, const uint8_t *const submitted_report)
 {
-	ARG_UNUSED(dev);
-	if (!atomic_test_and_clear_bit(hid_ep_out_busy, HID_EP_BUSY_FLAG)) {
-		LOG_WRN("OUT endpoint callback without preceding buffer read");
+	if (dev != hdev) {
+		return;
+	}
+
+	if (submitted_report != (const uint8_t *)ep_report_buffer &&
+	    receiver_usb_is_configured() && hid_ready) {
+		LOG_WRN("IN endpoint callback for unexpected report buffer");
+	}
+
+	int_in_ready_cb(dev);
+}
+
+static void iface_ready_cb(const struct device *dev, const bool ready)
+{
+	if (dev != hdev) {
+		return;
+	}
+
+	hid_ready = ready;
+	if (!ready) {
+		atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
 	}
 }
 
-/*
- * On Idle callback is available here as an example even if actual use is
- * very limited. In contrast to report_event_handler(),
- * report value is not incremented here.
- */
-static void on_idle_cb(const struct device *dev, uint16_t report_id)
+static int get_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
+			 const uint16_t len, uint8_t *const buf)
 {
-	LOG_DBG("On idle callback");
+	if (dev != hdev) {
+		return -ENODEV;
+	}
+
+	if (type != HID_REPORT_TYPE_INPUT || id != 0U) {
+		return -ENOTSUP;
+	}
+
+	if (len < sizeof(ep_report_buffer) || buf == NULL) {
+		return -EINVAL;
+	}
+
+	memset(buf, 0, sizeof(ep_report_buffer));
+	return sizeof(ep_report_buffer);
+}
+
+static int set_report_cb(const struct device *dev, const uint8_t type, const uint8_t id,
+			 const uint16_t len, const uint8_t *const buf)
+{
+	if (dev != hdev) {
+		return -ENODEV;
+	}
+
+	if (type != HID_REPORT_TYPE_OUTPUT || id != 0U) {
+		return -ENOTSUP;
+	}
+
+	if (len == 0U || len > 64U || buf == NULL) {
+		return -EINVAL;
+	}
+
+	handle_output_report(buf, len);
+	return 0;
+}
+
+static void on_idle_cb(const struct device *dev, const uint8_t report_id, const uint32_t duration)
+{
+	if (dev != hdev || report_id != 0U) {
+		return;
+	}
+
+	hid_idle_duration_ms = duration;
 	k_work_submit(&report_send);
+}
+
+static uint32_t get_idle_cb(const struct device *dev, const uint8_t report_id)
+{
+	if (dev != hdev || report_id != 0U) {
+		return 0;
+	}
+
+	return hid_idle_duration_ms;
+}
+
+static void output_report_cb(const struct device *dev, const uint16_t len, const uint8_t *const buf)
+{
+	if (dev != hdev || len == 0U || len > 64U || buf == NULL) {
+		return;
+	}
+
+	handle_output_report(buf, len);
 }
 
 static void report_event_handler(struct k_timer *dummy)
 {
-	if (usb_enabled)
-		k_work_submit(&report_send);
-}
-
-static void report_read_handler(struct k_timer *dummy);
-static K_TIMER_DEFINE(read_timer, report_read_handler, NULL);
-
-static void report_read_handler(struct k_timer *dummy)
-{
 	ARG_UNUSED(dummy);
-	if (usb_enabled)
-		k_work_submit(&report_read);
-}
-
-static void protocol_cb(const struct device *dev, uint8_t protocol)
-{
-	LOG_INF("New protocol: %s", protocol == HID_PROTOCOL_BOOT ?
-		"boot" : "report");
-}
-
-static const struct hid_ops ops = {
-	.int_in_ready = int_in_ready_cb,
-	.int_out_ready = int_out_ready_cb,
-	.on_idle = on_idle_cb,
-	.protocol_change = protocol_cb,
-};
-
-static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
-{
-	switch (status) {
-	case USB_DC_RESET:
-		configured = false;
-		break;
-	case USB_DC_CONFIGURED:
-		int configurationIndex = *param;
-		if(configurationIndex == 0) {
-			// from usb_device.c: A configuration index of 0 unconfigures the device.
-			configured = false;
-		} else {
-			if (!configured) {
-				int_in_ready_cb(hdev);
-				configured = true;
-			}
-		}
-		break;
-	case USB_DC_SOF:
-		break;
-	default:
-		LOG_DBG("status %u unhandled", status);
-		break;
+	if (receiver_usb_is_enabled()) {
+		k_work_submit(&report_send);
 	}
 }
 
-static int composite_pre_init()
+static const struct hid_device_ops ops = {
+	.iface_ready = iface_ready_cb,
+	.get_report = get_report_cb,
+	.set_report = set_report_cb,
+	.set_idle = on_idle_cb,
+	.get_idle = get_idle_cb,
+	.input_report_done = input_report_done_cb,
+	.output_report = output_report_cb,
+};
+
+static void hid_usb_state_changed(bool configured)
 {
-	hdev = device_get_binding("HID_0");
-	if (hdev == NULL) {
+	if (!configured) {
+		hid_ready = false;
+		atomic_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
+	}
+}
+
+static int composite_pre_init(void)
+{
+	hdev = DEVICE_DT_GET(DT_NODELABEL(hid_dev_0));
+	if (!device_is_ready(hdev)) {
 		LOG_ERR("Cannot get USB HID Device");
 		return -ENODEV;
 	}
 
 	LOG_INF("HID Device: dev %p", hdev);
 
-	usb_hid_register_device(hdev, hid_report_desc, sizeof(hid_report_desc),
-				&ops);
-
-	atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
-	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
-	atomic_set_bit(hid_ep_out_busy, HID_EP_BUSY_FLAG);
-	k_timer_start(&read_timer, POLL_PERIOD, POLL_PERIOD);
-
-	if (usb_hid_set_proto_code(hdev, HID_BOOT_IFACE_CODE_NONE)) {
-		LOG_WRN("Failed to set Protocol Code");
+	int ret = hid_device_register(hdev, hid_report_desc, sizeof(hid_report_desc), &ops);
+	if (ret != 0) {
+		LOG_ERR("Failed to register HID device: %d", ret);
+		return ret;
 	}
 
-	return usb_hid_init(hdev);
+	k_work_init(&report_send, send_report);
+	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
+	receiver_usb_set_state_callback(hid_usb_state_changed);
+
+	return 0;
 }
 
 SYS_INIT(composite_pre_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
-
-void usb_init_thread(void)
-{
-	usb_enable(status_cb);
-	k_work_init(&report_send, send_report);
-	k_work_init(&report_read, read_report);
-	usb_enabled = true;
-}
-
-K_THREAD_DEFINE(usb_init_thread_id, 256, usb_init_thread, NULL, NULL, NULL, 6, 0, 0);
 
 //|type    |description
 //|RX     0|device info ("info")

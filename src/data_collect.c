@@ -21,7 +21,6 @@
 	THE SOFTWARE.
 */
 
-#include "globals.h"
 #include "data_collect.h"
 #include "connection/esb.h"
 
@@ -89,34 +88,93 @@ static void buf_put(uint8_t byte)
 	dc_buf_head = (dc_buf_head + 1) % DATA_COLLECT_BUF_SIZE;
 }
 
-/* Flush ring buffer to CDC UART (called from workqueue) */
-static void dc_flush_work_handler(struct k_work *work);
-static K_WORK_DEFINE(dc_flush_work, dc_flush_work_handler);
-
-static void dc_flush_work_handler(struct k_work *work)
+static bool cdc_host_is_open(void)
 {
-	ARG_UNUSED(work);
-
-	if (!cdc_dev) return;
-
-	/* Only send when a host has opened the port (DTR asserted) */
 	uint32_t dtr = 0;
-	if (uart_line_ctrl_get(cdc_dev, UART_LINE_CTRL_DTR, &dtr) != 0 || !dtr) {
-		/* No host listening — silently discard buffered data to avoid
-		 * unbounded ring buffer growth while nobody is connected. */
-		dc_buf_tail = dc_buf_head;
+
+	return cdc_dev != NULL &&
+	       uart_line_ctrl_get(cdc_dev, UART_LINE_CTRL_DTR, &dtr) == 0 &&
+	       dtr != 0;
+}
+
+static void dc_discard_buffer(void)
+{
+	dc_buf_tail = dc_buf_head;
+}
+
+static uint32_t dc_contiguous_len(void)
+{
+	uint32_t head = dc_buf_head;
+	uint32_t tail = dc_buf_tail;
+
+	if (tail == head) {
+		return 0;
+	}
+
+	if (tail < head) {
+		return head - tail;
+	}
+
+	return DATA_COLLECT_BUF_SIZE - tail;
+}
+
+static void dc_uart_irq_callback(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	if (dev != cdc_dev) {
 		return;
 	}
 
-	while (dc_buf_tail != dc_buf_head) {
-		uint8_t byte = dc_buf[dc_buf_tail];
-		/* uart_poll_out blocks until the byte is accepted */
-		uart_poll_out(cdc_dev, byte);
-		dc_buf_tail = (dc_buf_tail + 1) % DATA_COLLECT_BUF_SIZE;
+	while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
+		if (!uart_irq_tx_ready(dev)) {
+			continue;
+		}
+
+		if (!cdc_host_is_open()) {
+			dc_discard_buffer();
+			uart_irq_tx_disable(dev);
+			continue;
+		}
+
+		uint32_t len = dc_contiguous_len();
+		if (len == 0) {
+			uart_irq_tx_disable(dev);
+			continue;
+		}
+
+		int sent = uart_fifo_fill(dev, &dc_buf[dc_buf_tail], len);
+		if (sent <= 0) {
+			uart_irq_tx_disable(dev);
+			continue;
+		}
+
+		dc_buf_tail = (dc_buf_tail + (uint32_t)sent) % DATA_COLLECT_BUF_SIZE;
+		if (dc_buf_tail == dc_buf_head) {
+			uart_irq_tx_disable(dev);
+		}
 	}
 }
 
-/* Periodic flush timer - ensures data gets sent even without new packets */
+static void dc_tx_kick_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!cdc_dev) {
+		return;
+	}
+
+	if (!cdc_host_is_open()) {
+		dc_discard_buffer();
+		return;
+	}
+
+	if (dc_buf_tail != dc_buf_head) {
+		uart_irq_tx_enable(cdc_dev);
+	}
+}
+static K_WORK_DEFINE(dc_tx_kick_work, dc_tx_kick_work_handler);
+
 static void dc_timer_handler(struct k_timer *timer);
 static K_TIMER_DEFINE(dc_timer, dc_timer_handler, NULL);
 
@@ -138,7 +196,7 @@ static void dc_timeout_work_handler(struct k_work *work)
 static void dc_timer_handler(struct k_timer *timer)
 {
 	ARG_UNUSED(timer);
-	k_work_submit(&dc_flush_work);
+	k_work_submit(&dc_tx_kick_work);
 
 	/* Check for data collection timeout */
 	if (dc_active && dc_last_rx_time > 0 &&
@@ -156,12 +214,17 @@ int data_collect_init(void)
 		return -ENODEV;
 	}
 
+	int ret = uart_irq_callback_user_data_set(cdc_dev, dc_uart_irq_callback, NULL);
+	if (ret != 0) {
+		LOG_ERR("Failed to set CDC ACM IRQ callback: %d", ret);
+		return ret;
+	}
+
 	cdc_ready = true;
 	dc_frames_sent = 0;
 	dc_frames_dropped = 0;
 	dc_active = false;
 
-	/* Start periodic flush at 1ms to keep latency low */
 	k_timer_start(&dc_timer, K_MSEC(1), K_MSEC(1));
 
 	LOG_INF("Data collection subsystem initialized");
@@ -250,6 +313,5 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 
 	dc_frames_sent++;
 
-	/* Trigger flush */
-	k_work_submit(&dc_flush_work);
+	k_work_submit(&dc_tx_kick_work);
 }
