@@ -333,6 +333,82 @@ jobs:
             fi
           done
 
+
+      - name: 🧰 Install ARM bare-metal toolchain (FoxDongle combined hex)
+        id: install-arm-toolchain
+        if: ${{ matrix.boards.filename == 'SlimeNRF_FoxDongle_Receiver' }}
+        run: |
+          # Plain apt-get (not the apt cache action) so the newlib C headers/libs
+          # that live in transitive deps (e.g. libnewlib-dev, which owns the target
+          # string.h) are pulled in. The cache action only captures named packages.
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+          arm-none-eabi-gcc --version | head -1
+
+      - name: 🥾 Build FoxDongle Bootloader (foxdongle_nrf52840, no SoftDevice)
+        id: build-bootloader
+        if: ${{ matrix.boards.filename == 'SlimeNRF_FoxDongle_Receiver' }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          rm -rf fox-bootloader
+          # KenRouKoro's Adafruit_nRF52_Bootloader fork carries the
+          # foxdongle_nrf52840 board (UF2 volume "FOX-BOOT" — the bootloader the
+          # real dongles ship with). Pin to a specific commit (blobless clone +
+          # checkout) for reproducibility.
+          BL_SHA=95e85f15c1969735b930e29dfdb8df2748064ef4
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/KenRouKoro/Adafruit_nRF52_Bootloader.git fox-bootloader
+          cd fox-bootloader
+          git checkout "$BL_SHA"
+          git submodule update --init --depth 1
+          # `make all` would also build a DFU .zip (needs adafruit-nrfutil) and an
+          # SD-merged hex we don't need (the app loads at 0x1000 — no SoftDevice).
+          # Build only the no-SoftDevice image (MBR + bootloader) via a second
+          # makefile read AFTER the main Makefile, so $(BUILD)/$(OUT_NAME) are
+          # defined (a command-line --eval runs before the Makefile, when they are
+          # still empty). GIT_VERSION is overridden because git-describe on a
+          # pinned, tagless commit returns a bare SHA that the Makefile's version
+          # math cannot parse.
+          printf 'nosd_only: $(BUILD)/$(OUT_NAME)_nosd.hex\n' > nosd_only.mk
+          make -f Makefile -f nosd_only.mk \
+            BOARD=foxdongle_nrf52840 MCU_SUB_VARIANT=nrf52840 \
+            GIT_VERSION=0.9.2-fox-g95e85f1 nosd_only
+          echo "Bootloader output:"
+          ls -la _build/build-foxdongle_nrf52840/*_nosd.hex
+
+      - name: 🔗 Merge FoxDongle Bootloader + Application into single hex
+        id: merge-hex
+        if: ${{ matrix.boards.filename == 'SlimeNRF_FoxDongle_Receiver' && steps.build-firmware.outcome == 'success' }}
+        run: |
+          cd zephyr-workspace
+          REPO_DIR="${{ github.event.repository.name }}"
+          if [ ! -d "$REPO_DIR" ]; then
+            REPO_DIR="SlimeNRF-CI"
+          fi
+          mkdir -p Releases
+          BL=$(ls "$GITHUB_WORKSPACE"/fox-bootloader/_build/build-foxdongle_nrf52840/*_nosd.hex | head -1)
+          APP="$REPO_DIR/build/$REPO_DIR/zephyr/zephyr.hex"
+          echo "Bootloader hex: $BL"
+          echo "Application hex: $APP"
+          # The Adafruit (SDK11) bootloader only launches the app when its
+          # settings page (0xFF000 on nRF52840) flags bank_0 == BANK_VALID_APP.
+          # That flag is written by the UF2/DFU update flow, NOT by a raw J-Link
+          # flash, so a plain bootloader+app merge boots into DFU (UF2 drive)
+          # instead of the app. Generate a settings page marking the app valid.
+          # bank_0_crc=0 tells the bootloader to skip the CRC check (treated as
+          # valid), matching its own "stored crc of 0 == CRC checking not used"
+          # behaviour.
+          python3 -c "import struct; from intelhex import IntelHex; d=struct.pack('<HHH2x5I',1,0,0,0,0,0,0,0); ih=IntelHex(); ih.frombytes(d,offset=0xFF000); ih.write_hex_file('bl_settings.hex')"
+          # mergehex.py ships with the Zephyr workspace; python3 here resolves to
+          # the Zephyr venv (intelhex available). App (0x1000), bootloader/MBR/
+          # UICR (0xF4000+), and the settings page (0xFF000) do not overlap;
+          # --overlap=replace matches the merge convention used elsewhere.
+          python3 zephyr/scripts/build/mergehex.py --overlap=replace \
+            -o "Releases/${{ matrix.boards.filename }}_Combined.hex" "$BL" "$APP" bl_settings.hex
+          echo "Combined hex:"
+          ls -la "Releases/${{ matrix.boards.filename }}_Combined.hex"
+
       - name: 💾 Upload Artifact - ${{ matrix.boards.boardname }}
         id: upload-artifact
         if: ${{ steps.build-firmware.outcome == 'success' }}
@@ -343,3 +419,4 @@ jobs:
           path: |
             zephyr-workspace/Releases/${{ matrix.boards.filename }}.uf2
             zephyr-workspace/Releases/${{ matrix.boards.filename }}.hex
+            zephyr-workspace/Releases/${{ matrix.boards.filename }}_Combined.hex
