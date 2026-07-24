@@ -222,6 +222,8 @@ jobs:
                   {boardname: "foxdongle_uf2/nrf52840", filename: "SlimeNRF_FoxDongle_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "foxpromicro_rfek_uf2/nrf52840", filename: "SlimeNRF_FoxProMicro_RFEK_Receiver"},
                   {boardname: "foxpromicro_rfek_uf2/nrf52840", filename: "SlimeNRF_FoxProMicro_RFEK_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
+                  {boardname: "mochi_uf2/nrf52833", filename: "SlimeNRF_Mochi_Receiver"},
+                  {boardname: "mochi_uf2/nrf52833", filename: "SlimeNRF_Mochi_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                 ]
     runs-on: ubuntu-latest
     steps:
