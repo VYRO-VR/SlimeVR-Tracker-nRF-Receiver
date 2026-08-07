@@ -677,7 +677,9 @@ void esb_ota_relay_process_tracker_packet(const uint8_t *data, size_t len)
 				    status == OTA_STATUS_VERIFY_FAIL ||
 				    status == OTA_STATUS_TIMEOUT ||
 				    status == OTA_STATUS_BOARD_MISMATCH ||
-				    status == OTA_STATUS_SIZE_ERROR);
+				    status == OTA_STATUS_SIZE_ERROR ||
+				    status == OTA_STATUS_FLASH_ERROR ||
+				    status == OTA_STATUS_SEQ_ERROR);
 		bool status_changed = (status != prev_status);
 
 		int64_t now = k_uptime_get();
@@ -690,7 +692,8 @@ void esb_ota_relay_process_tracker_packet(const uint8_t *data, size_t len)
 				LOG_WRN("OTA VERIFY_FAIL: tracker=%u", tracker_id);
 			}
 
-			LOG_INF("OTA Status: tracker=%u status=0x%02X seq=%u bytes=%u ring=%u",
+			/* Throttled path runs from EVENT IRQ — keep UART off hot path. */
+			LOG_DBG("OTA Status: tracker=%u status=0x%02X seq=%u bytes=%u ring=%u",
 				tracker_id, status, next_seq, bytes_written, ring_count());
 
 			/* Forward to PC via HID IN report */

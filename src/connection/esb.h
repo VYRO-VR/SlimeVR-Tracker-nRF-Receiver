@@ -54,43 +54,45 @@
 #define ESB_PONG_FLAG_RESET_BAT 0x10
 #define ESB_PONG_FLAG_PING 0x11
 #define ESB_PONG_FLAG_RESET_TCAL 0x12
-#define ESB_PONG_FLAG_TCAL_AUTO_ON 0x13  // Enable T-Cal auto-calibration
-#define ESB_PONG_FLAG_TCAL_AUTO_OFF 0x14 // Disable T-Cal auto-calibration
-#define ESB_PONG_FLAG_FUSION_RESET 0x15  // Reset fusion (invalidate quaternion)
-#define ESB_PONG_FLAG_TCAL_BOOT_ON 0x16  // Enable T-Cal boot calibration
-#define ESB_PONG_FLAG_TCAL_BOOT_OFF 0x17 // Disable T-Cal boot calibration
-#define ESB_PONG_FLAG_MAG_CAL 0x18       // Trigger magnetometer calibration
-#define ESB_PONG_FLAG_MAG_ON 0x19        // Enable magnetometer
-#define ESB_PONG_FLAG_MAG_OFF 0x1A       // Disable magnetometer
-#define ESB_PONG_FLAG_TCAL_ON 0x1B       // Enable T-Cal (temperature calibration)
-#define ESB_PONG_FLAG_TCAL_OFF 0x1C      // Disable T-Cal (temperature calibration)
-#define ESB_PONG_FLAG_TDMA_ON 0x1D       // Enable TDMA scheduling
-#define ESB_PONG_FLAG_TDMA_OFF 0x1E      // Disable TDMA scheduling
-#define ESB_PONG_FLAG_TEST_MODE_ON 0x1F  // Enable battery drain test mode
-#define ESB_PONG_FLAG_TEST_MODE_OFF 0x20 // Disable battery drain test mode
-#define ESB_PONG_FLAG_DFU_OTA 0x21       // Enter OTA DFU bootloader
+#define ESB_PONG_FLAG_TCAL_AUTO_ON 0x13     // Enable T-Cal auto-calibration
+#define ESB_PONG_FLAG_TCAL_AUTO_OFF 0x14    // Disable T-Cal auto-calibration
+#define ESB_PONG_FLAG_FUSION_RESET 0x15     // Reset fusion (invalidate quaternion)
+#define ESB_PONG_FLAG_TCAL_BOOT_ON 0x16     // Enable T-Cal boot calibration
+#define ESB_PONG_FLAG_TCAL_BOOT_OFF 0x17    // Disable T-Cal boot calibration
+#define ESB_PONG_FLAG_MAG_CAL 0x18          // Trigger magnetometer calibration
+#define ESB_PONG_FLAG_MAG_ON 0x19           // Enable magnetometer
+#define ESB_PONG_FLAG_MAG_OFF 0x1A          // Disable magnetometer
+#define ESB_PONG_FLAG_TCAL_ON 0x1B          // Enable T-Cal (temperature calibration)
+#define ESB_PONG_FLAG_TCAL_OFF 0x1C         // Disable T-Cal (temperature calibration)
+#define ESB_PONG_FLAG_TDMA_ON 0x1D          // Enable TDMA scheduling
+#define ESB_PONG_FLAG_TDMA_OFF 0x1E         // Disable TDMA scheduling
+#define ESB_PONG_FLAG_TEST_MODE_ON 0x1F     // Enable battery drain test mode
+#define ESB_PONG_FLAG_TEST_MODE_OFF 0x20    // Disable battery drain test mode
+#define ESB_PONG_FLAG_DFU_OTA 0x21          // Enter OTA DFU bootloader
 #define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
 #define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
 #define ESB_PONG_FLAG_SENS_AUTO 0x24        // Auto-calibrate gyro sensitivity
+#define ESB_PONG_FLAG_MAG_AUTO_ON 0x25      // Enable online magnetometer calibration
+#define ESB_PONG_FLAG_MAG_AUTO_OFF 0x26     // Disable online magnetometer calibration
 #define ESB_PONG_FLAG_OTA_QUERY_INFO 0x30   // Request firmware info for ESB OTA
 #define ESB_PONG_FLAG_OTA_ABORT 0x31        // Abort ESB OTA update
 #define ESB_PONG_FLAG_OTA_SUPPRESS 0x32     // Suppress tracker during OTA (reduce poll rate)
 #define ESB_PONG_FLAG_OTA_UNSUPPRESS 0x33   // Resume normal poll rate after OTA
 
 // Raw data collection packet types
-#define ESB_RAW_IMU_TYPE    0x10  // Raw IMU data (float, with piggybacked mag)
-#define ESB_RAW_MAG_TYPE    0x11  // Raw magnetometer data (float, reserved)
-#define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
-#define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (52 bytes, packet-loss resistant)
-#define ESB_RAW_CAL_TYPE    0x14  // Extended calibration metadata (sub-typed)
+#define ESB_RAW_IMU_TYPE 0x10      // Raw IMU data (float, with piggybacked mag)
+#define ESB_RAW_MAG_TYPE 0x11      // Raw magnetometer data (float, reserved)
+#define ESB_RAW_META_TYPE 0x12     // Metadata (ODR, range, sensor IDs - sent once)
+#define ESB_RAW_IMU_QUAT_TYPE 0x13 // Raw IMU with gyrQuat (52 bytes, packet-loss resistant)
+#define ESB_RAW_CAL_TYPE 0x14      // Extended calibration metadata (sub-typed)
 
 // ESB OTA packet types (used during firmware update over ESB)
-#define ESB_OTA_DATA_TYPE       0x20  // OTA firmware data (receiver → tracker)
-#define ESB_OTA_STATUS_TYPE     0x21  // OTA status report (tracker → receiver)
-#define ESB_OTA_FW_INFO_TYPE    0x22  // Firmware info report (tracker → receiver)
-#define ESB_OTA_BEGIN_TYPE      0x23  // Begin OTA session (receiver → tracker)
-#define ESB_OTA_VERIFY_TYPE     0x24  // Request CRC verification (receiver → tracker)
-#define ESB_OTA_ACTIVATE_TYPE   0x25  // Activate new firmware (receiver → tracker)
+#define ESB_OTA_DATA_TYPE 0x20     // OTA firmware data (receiver → tracker)
+#define ESB_OTA_STATUS_TYPE 0x21   // OTA status report (tracker → receiver)
+#define ESB_OTA_FW_INFO_TYPE 0x22  // Firmware info report (tracker → receiver)
+#define ESB_OTA_BEGIN_TYPE 0x23    // Begin OTA session (receiver → tracker)
+#define ESB_OTA_VERIFY_TYPE 0x24   // Request CRC verification (receiver → tracker)
+#define ESB_OTA_ACTIVATE_TYPE 0x25 // Activate new firmware (receiver → tracker)
 
 void event_handler(struct esb_evt const *event);
 int clocks_start(void);
@@ -116,19 +118,30 @@ void esb_write_sync(uint16_t led_clock);
 void esb_receive(void);
 
 // Statistics display control
-bool esb_toggle_stats_detailed(void);           // Toggle detailed stats on/off
+bool esb_toggle_stats_detailed(void);                   // Toggle detailed stats on/off
 void esb_set_stats_detailed(uint32_t duration_seconds); // Enable for duration (0 = toggle)
-bool esb_get_stats_detailed_enabled(void);      // Get current status
-uint32_t esb_get_stats_detailed_remaining(void); // Get remaining time (0 if no auto-disable)
+bool esb_get_stats_detailed_enabled(void);              // Get current status
+uint32_t esb_get_stats_detailed_remaining(void);        // Get remaining time (0 if no auto-disable)
 
 // Remote command API
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag);
-void esb_send_remote_command_all(uint8_t command_flag);
+/* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */
+uint32_t esb_send_remote_command_all(uint8_t command_flag);
 void esb_send_remote_command_sens(uint8_t tracker_id, float x, float y, float z);
 bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_t revolutions);
-uint8_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions);
-void esb_set_all_trackers_channel(uint8_t channel); // Set RF channel for all trackers
-void esb_clear_all_trackers_channel(void);          // Clear RF channel setting (restore default)
+/* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */
+uint32_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions);
+/* Returns 0 if started, -EINVAL bad channel, -EBUSY if another change pending. */
+int esb_set_all_trackers_channel(uint8_t channel);
+int esb_clear_all_trackers_channel(void);
+
+/* Optional: called once when tracker channel change finishes or times out. */
+typedef void (*esb_channel_change_done_cb_t)(bool success);
+void esb_set_channel_change_done_cb(esb_channel_change_done_cb_t cb);
+
+/* Optional: called when a tracker confirms a remote PONG flag (event_handler). */
+typedef void (*esb_remote_confirm_cb_t)(uint8_t tracker_id, uint8_t flag);
+void esb_set_remote_confirm_cb(esb_remote_confirm_cb_t cb);
 
 // Local receiver channel management
 void esb_set_receiver_channel(uint8_t channel); // Set receiver RF channel only (local)

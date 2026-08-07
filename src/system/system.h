@@ -5,8 +5,6 @@
 #include "status.h"
 
 #define STORED_TRACKERS 1
-#define STORED_TRACKER_ADDR 2
-
 #define RBT_CNT_ID 2
 #define STORED_ADDR_0 3
 // 0-15 -> id 3-18
@@ -23,5 +21,10 @@ void sys_read(uint16_t id, void* data, size_t len);
 bool button_read(void);
 void sys_request_system_off(void);
 void sys_request_system_reboot(void);
+
+/* Enter bootloader DFU (UF2 default, or OTA when ota=true on Adafruit BL). */
+void sys_enter_dfu(bool ota);
+/* Mark next reboot to skip Adafruit double-reset DFU entry. */
+void sys_skip_dfu_marker(void);
 
 #endif

@@ -22,6 +22,7 @@
 */
 #include "esb.h"
 
+#include <errno.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/atomic.h>
@@ -40,10 +41,9 @@ LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 //|RX  CRC8|pairing
 //|TX  CRC8|pairing
 
-//|b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11     |b12     |b13     |b14     |b15     |
-//|type    |data                                                                                                                                  |
-//|RX  CRC8|ack     |device_addr                                          |-
-//|TX  CRC8|ack     |recv_addr                                            |-
+//|b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11     |b12 |b13
+//|b14     |b15     | |type    |data | |RX  CRC8|ack     |device_addr                                          |- |TX
+//CRC8|ack     |recv_addr                                            |-
 
 //|packet  |description
 //|RX     1|request from tracker
@@ -52,19 +52,17 @@ LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 //|TX     4|No Windows
 //|TX     5|Window Info
 
-//|packet  |b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11     |b12     |b13     |b14     |b15     |
-//|RX     1|    0xCD|    0x01|    0x00|Tracker Hardware ID                                  |Tracker Hardware ID                                  |-
-//|TX     2|    0xCD|    0x02|Trckr ID|Dongle Hardware ID                                   |Tracker Hardware ID                                  |-
-//|TX     3|    0xCD|    0x03|Dongle Hardware ID                                   |state   |channel |-
-//|TX     4|    0xCD|    0x04|-
-//|TX     5|    0xCD|    0x05|Window  |Timer                              |Packet  |-
+//|packet  |b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11 |b12
+//|b13     |b14     |b15     | |RX     1|    0xCD|    0x01|    0x00|Tracker Hardware ID |Tracker Hardware ID |- |TX 2|
+//0xCD|    0x02|Trckr ID|Dongle Hardware ID                                   |Tracker Hardware ID |- |TX     3| 0xCD|
+//0x03|Dongle Hardware ID                                   |state   |channel |- |TX     4|    0xCD|    0x04|- |TX 5|
+//0xCD|    0x05|Window  |Timer                              |Packet  |-
 
 // packet 3:
 // state field bits: 9[0:0]: Accepts new trackers?; 9[1:1]: Force pair
 // channel bundle field bits: 10[0:3]: Channels bundle; 10[4:7]: Next channel offset
 // packet 5:
 // Packet: Packet Number
-
 
 #define RADIO_RETRANSMIT_DELAY CONFIG_RADIO_RETRANSMIT_DELAY
 #define RADIO_RF_CHANNEL CONFIG_RADIO_RF_CHANNEL
@@ -75,28 +73,27 @@ LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 // TDMA config (slot index, total slots, slot ticks, epoch) into a volatile
 // uint32_t that the RADIO ISR reads atomically when constructing PONG packets.
 #define TDMA_ENABLED 1
-#define TDMA_MIN_SLOT_TICKS    14  /* minimum slot width (~427μs at 32768Hz) */
-#define TDMA_TPS_TIER_HIGH   260  /* per-tracker TPS target for ≤3 trackers */
-#define TDMA_TPS_TIER_MID_H  220  /* per-tracker TPS target for 4-5 trackers */
-#define TDMA_TPS_TIER_MID    200  /* per-tracker TPS target for 6 trackers */
-#define TDMA_TPS_TIER_LOW    190  /* per-tracker TPS target for ≥7 trackers */
-#define TDMA_MIN_EFF_SLOT     18  /* effective slot floor → aggregate ≤ ~1820 TPS */
-#define TDMA_TOLERANCE_TICKS    3  /* slot violation tolerance band */
-#define TDMA_RECONFIG_MIN_MS 5000  /* minimum interval between TDMA reconfigurations */
+#define TDMA_MIN_SLOT_TICKS 14    /* minimum slot width (~427μs at 32768Hz) */
+#define TDMA_TPS_TIER_HIGH 260    /* per-tracker TPS target for ≤3 trackers */
+#define TDMA_TPS_TIER_MID_H 220   /* per-tracker TPS target for 4-5 trackers */
+#define TDMA_TPS_TIER_MID 200     /* per-tracker TPS target for 6 trackers */
+#define TDMA_TPS_TIER_LOW 190     /* per-tracker TPS target for ≥7 trackers */
+#define TDMA_MIN_EFF_SLOT 18      /* effective slot floor → aggregate ≤ ~1820 TPS */
+#define TDMA_TOLERANCE_TICKS 3    /* slot violation tolerance band */
+#define TDMA_RECONFIG_MIN_MS 5000 /* minimum interval between TDMA reconfigurations */
 
 // Dynamic TDMA config packed into uint32_t for atomic ISR access (ARM Cortex-M).
 // Layout: [31:24]=assigned_slot, [23:16]=total_slots, [15:8]=slot_ticks, [7:0]=epoch
 static volatile uint32_t tdma_config_packed[MAX_TRACKERS];
-static uint8_t tdma_config_epoch;           // wrapping counter, incremented on each recalc
-static uint8_t tdma_dynamic_active_count;   // current number of active trackers
-static uint8_t tdma_dynamic_slot_ticks;     // current slot width in ticks
-static uint32_t tdma_active_mask;           // bitmask of active trackers (for change detection)
-static int64_t tdma_last_reconfig_time;     // timestamp of last reconfiguration (0 = never)
+static uint8_t tdma_config_epoch;         // wrapping counter, incremented on each recalc
+static uint8_t tdma_dynamic_active_count; // current number of active trackers
+static uint8_t tdma_dynamic_slot_ticks;   // current slot width in ticks
+static uint32_t tdma_active_mask;         // bitmask of active trackers (for change detection)
+static int64_t tdma_last_reconfig_time;   // timestamp of last reconfiguration (0 = never)
 
 static inline uint32_t tdma_pack_config(uint8_t slot, uint8_t total, uint8_t slot_ticks, uint8_t epoch)
 {
-	return ((uint32_t)slot << 24) | ((uint32_t)total << 16)
-	     | ((uint32_t)slot_ticks << 8) | (uint32_t)epoch;
+	return ((uint32_t)slot << 24) | ((uint32_t)total << 16) | ((uint32_t)slot_ticks << 8) | (uint32_t)epoch;
 }
 
 /* Forward declaration — defined after last_ping_time / PING_TIMEOUT_MS */
@@ -129,7 +126,7 @@ static volatile uint8_t pending_sens_auto_axis[MAX_TRACKERS];
 static volatile uint16_t pending_sens_auto_revolutions[MAX_TRACKERS];
 static uint8_t receiver_rf_channel = 0xFF; // Current RF channel of the receiver, 0xFF indicates using default value
 
-#define PING_TIMEOUT_MS 5000 // PING timeout threshold: 5 seconds
+#define PING_TIMEOUT_MS 5000               // PING timeout threshold: 5 seconds
 #define REMOTE_COMMAND_ACTIVE_SCAN_MS 1000 // Time window to detect trackers actively sending data
 
 /**
@@ -145,8 +142,7 @@ static void tdma_recalculate(void)
 
 	/* Scan for active trackers (received PING within timeout) */
 	for (uint8_t i = 0; i < stored_trackers && i < MAX_TRACKERS; i++) {
-		if (last_ping_time[i] > 0 &&
-		    (now - last_ping_time[i]) <= PING_TIMEOUT_MS) {
+		if (last_ping_time[i] > 0 && (now - last_ping_time[i]) <= PING_TIMEOUT_MS) {
 			active_ids[active_count++] = i;
 			new_mask |= (1U << i);
 		}
@@ -170,8 +166,8 @@ static void tdma_recalculate(void)
 	 * immediately so they stop transmitting in ALOHA mode ASAP.
 	 */
 	bool new_trackers_appeared = (new_mask & ~tdma_active_mask) != 0;
-	if (!new_trackers_appeared && tdma_last_reconfig_time > 0 &&
-	    (now - tdma_last_reconfig_time) < TDMA_RECONFIG_MIN_MS) {
+	if (!new_trackers_appeared && tdma_last_reconfig_time > 0
+		&& (now - tdma_last_reconfig_time) < TDMA_RECONFIG_MIN_MS) {
 		return;
 	}
 
@@ -179,9 +175,9 @@ static void tdma_recalculate(void)
 
 	/* Tiered TPS: ≤3 → 260, 4-5 → 220, 6 → 200, ≥7 → 180, with aggregate cap */
 	uint16_t target_tps = (active_count <= 3) ? TDMA_TPS_TIER_HIGH
-	                    : (active_count <= 5) ? TDMA_TPS_TIER_MID_H
-	                    : (active_count <= 6) ? TDMA_TPS_TIER_MID
-	                    : TDMA_TPS_TIER_LOW;
+						: (active_count <= 5) ? TDMA_TPS_TIER_MID_H
+						: (active_count <= 6) ? TDMA_TPS_TIER_MID
+											  : TDMA_TPS_TIER_LOW;
 	uint32_t numerator = 32768;
 	uint32_t denominator = (uint32_t)target_tps * active_count;
 	uint8_t slot_ticks = (uint8_t)((numerator + denominator - 1) / denominator);
@@ -215,8 +211,14 @@ static void tdma_recalculate(void)
 	if (active_count != old_count || slot_ticks != old_slot) {
 		uint32_t frame_ticks = (uint32_t)slot_ticks * active_count;
 		uint32_t est_tps = frame_ticks > 0 ? 32768 / frame_ticks : 0;
-		LOG_INF("TDMA reconfig: %u active, slot=%u ticks, frame=%u ticks, ~%u TPS/trk (epoch=%u)",
-			active_count, slot_ticks, frame_ticks, est_tps, epoch);
+		LOG_INF(
+			"TDMA reconfig: %u active, slot=%u ticks, frame=%u ticks, ~%u TPS/trk (epoch=%u)",
+			active_count,
+			slot_ticks,
+			frame_ticks,
+			est_tps,
+			epoch
+		);
 	}
 }
 
@@ -226,20 +228,21 @@ static uint8_t pending_channel = 0;                      // The channel value to
 static atomic_t channel_ack_mask
 	= ATOMIC_INIT(0);                      // Bitmask to track which trackers have acknowledged the channel change
 static int64_t channel_change_timeout = 0; // Timestamp for channel change timeout
-#define CHANNEL_CHANGE_TIMEOUT_MS 30000    // Timeout duration for waiting for all trackers to acknowledge
+static esb_channel_change_done_cb_t channel_change_done_cb;
+static esb_remote_confirm_cb_t remote_confirm_cb;
+#define CHANNEL_CHANGE_TIMEOUT_MS 30000 // Timeout duration for waiting for all trackers to acknowledge
 
 // Pairing state (declared here for ISR access in event_handler)
 static bool esb_pairing = false;
-static bool esb_paired = false;
 static bool esb_clearing = false;
 
 // Pairing timeout and target count
 static int64_t pairing_start_time = 0;
-static uint8_t pairing_target_count = 0; // 0 = no limit, >0 = exit after N new devices
-static uint8_t pairing_initial_count = 0; // Number of devices when pairing started
-static int64_t pairing_target_reached_time = 0; // Time when target count was reached (for delayed exit)
+static uint8_t pairing_target_count = 0;                  // 0 = no limit, >0 = exit after N new devices
+static uint8_t pairing_initial_count = 0;                 // Number of devices when pairing started
+static int64_t pairing_target_reached_time = 0;           // Time when target count was reached (for delayed exit)
 static volatile bool pairing_new_devices_blocked = false; // When true, only allow re-pairing of known devices
-#define PAIRING_EXIT_DELAY_MS 15000 // Delay before exiting after target count reached
+#define PAIRING_EXIT_DELAY_MS 15000                       // Delay before exiting after target count reached
 
 // Cached receiver device address (set once at init, used by ISR for pairing responses)
 static uint8_t receiver_device_addr[6] = {0};
@@ -282,21 +285,22 @@ static struct packet_stats tracker_stats[MAX_TRACKERS] = {0};
 #define TPS_MONITOR_INTERVAL_MS 500
 
 // Statistics display control
-static volatile bool stats_detailed_enabled = false;        // Whether detailed stats are enabled
-static volatile int64_t stats_detailed_end_time = 0;        // Timestamp when detailed stats should auto-disable (0 = no auto-disable)
-static int64_t last_tps_print_time = 0;                     // Last time total TPS was printed
+static volatile bool stats_detailed_enabled = false; // Whether detailed stats are enabled
+static volatile int64_t stats_detailed_end_time
+	= 0;                                // Timestamp when detailed stats should auto-disable (0 = no auto-disable)
+static int64_t last_tps_print_time = 0; // Last time total TPS was printed
 
 // TDMA Statistics
 struct tdma_stats {
-	int64_t sum_offset;      // Sum of center offsets in ticks
-	uint64_t sum_sq_offset;  // Sum of squared offsets for variance
-	int32_t min_offset;      // Minimum offset seen
-	int32_t max_offset;      // Maximum offset seen
-	uint32_t count;          // Packet count
-	uint32_t violations;     // Slot violation count (deviation from running mean)
-	int64_t last_log_time;   // Last log output time
-	int32_t phase_ema_q8;    // EMA of ref_offset in Q8 fixed-point (×256)
-	bool phase_initialized;  // Whether EMA has been seeded
+	int64_t sum_offset;     // Sum of center offsets in ticks
+	uint64_t sum_sq_offset; // Sum of squared offsets for variance
+	int32_t min_offset;     // Minimum offset seen
+	int32_t max_offset;     // Maximum offset seen
+	uint32_t count;         // Packet count
+	uint32_t violations;    // Slot violation count (deviation from running mean)
+	int64_t last_log_time;  // Last log output time
+	int32_t phase_ema_q8;   // EMA of ref_offset in Q8 fixed-point (×256)
+	bool phase_initialized; // Whether EMA has been seeded
 };
 
 static struct tdma_stats g_tdma_stats[MAX_TRACKERS] = {0};
@@ -367,8 +371,8 @@ static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks)
 	/* Read dynamic TDMA config (atomic 32-bit load) */
 	uint32_t cfg = tdma_config_packed[tracker_id];
 	uint8_t expected_slot = (cfg >> 24) & 0xFF;
-	uint8_t total_slots   = (cfg >> 16) & 0xFF;
-	uint8_t slot_ticks    = (cfg >> 8) & 0xFF;
+	uint8_t total_slots = (cfg >> 16) & 0xFF;
+	uint8_t slot_ticks = (cfg >> 8) & 0xFF;
 
 	/* Skip validation if tracker has no slot assignment or config invalid */
 	if (expected_slot == 0xFF || total_slots == 0 || slot_ticks == 0) {
@@ -383,9 +387,7 @@ static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks)
 	 * using the measured drift rate (ppb) to keep it accurate
 	 * between PING sync intervals.
 	 */
-	int32_t clock_bias = g_last_ping_rx_time_diff_valid[tracker_id]
-		? g_last_ping_rx_time_diff_ticks[tracker_id]
-		: 0;
+	int32_t clock_bias = g_last_ping_rx_time_diff_valid[tracker_id] ? g_last_ping_rx_time_diff_ticks[tracker_id] : 0;
 
 	/* Drift extrapolation: bias changes linearly between PINGs.
 	 * Use the long-baseline ppb estimate to correct for drift
@@ -489,14 +491,15 @@ static inline void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks)
 #endif
 
 static void esb_stats_thread(void);
-K_THREAD_DEFINE(esb_stats_thread_id, 512, esb_stats_thread, NULL, NULL, NULL, 8, 0, 0);
+K_THREAD_DEFINE(esb_stats_thread_id, 512, esb_stats_thread, NULL, NULL, NULL, ESB_STATS_THREAD_PRIORITY, 0, 0);
 
 static void esb_thread(void);
-K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, 7, 0, 0);
-K_THREAD_DEFINE(nvs_writer_thread_id, 1024, nvs_writer_thread, NULL, NULL, NULL, 9, 0, 0);
+K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, ESB_THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(nvs_writer_thread_id, 1024, nvs_writer_thread, NULL, NULL, NULL, NVS_WRITER_THREAD_PRIORITY, 0, 0);
 
 static bool esb_parse_pair(const uint8_t packet[8]);
 static void process_pairing_queue(void);
+static const char *esb_pong_flag_name(uint8_t flag);
 
 // Find tracker by address without locks.
 // On single-core ARM Cortex-M, compiler barrier ensures correct ordering.
@@ -507,7 +510,7 @@ static inline int esb_find_tracker(uint64_t addr)
 	if (addr == 0) {
 		return -1;
 	}
-	uint8_t count = stored_trackers; // single atomic byte read on ARM
+	uint8_t count = stored_trackers;   // single atomic byte read on ARM
 	__asm__ volatile("" ::: "memory"); // compiler barrier: ensure count is read before array
 	for (int i = 0; i < count && i < MAX_TRACKERS; i++) {
 		if (stored_tracker_addr[i] == addr) {
@@ -648,13 +651,7 @@ static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 		packet_count[tracker_id]++;
 		stats->last_sequence = received_seq;
 		// Log single gap only at DEBUG level to reduce output (summary statistics will show total gaps)
-		LOG_DBG(
-			"Gap detected: tracker=%d, seq=%d, gap=%d (forward=%d)",
-			tracker_id,
-			received_seq,
-			gaps,
-			diff_forward
-		);
+		LOG_DBG("Gap detected: tracker=%d, seq=%d, gap=%d (forward=%d)", tracker_id, received_seq, gaps, diff_forward);
 		return 1;
 	}
 
@@ -810,25 +807,23 @@ static void esb_stats_thread(void)
  *   ...
  * -------------------------------------------------------------------------*/
 #define RAW_ARQ_MAX_GAPS 8
-#define RAW_ARQ_MARKER   0xAA
+#define RAW_ARQ_MARKER 0xAA
 /* Maximum sequence distance before a gap is considered stale and unrecoverable.
  * Keep below the tracker's 256-packet raw ring so requests never target
  * overwritten slots after ACK/processing latency. */
 #define RAW_ARQ_STALE_DISTANCE 200
 
 static volatile uint16_t raw_arq_expected_seq;
-static volatile bool     raw_arq_seq_initialized;
+static volatile bool raw_arq_seq_initialized;
 static volatile uint16_t raw_arq_gap_queue[RAW_ARQ_MAX_GAPS];
-static volatile uint8_t  raw_arq_gap_count;
+static volatile uint8_t raw_arq_gap_count;
 /* Counters for diagnostics (read by event_handler, not ISR-critical) */
 static volatile uint32_t raw_arq_gaps_detected;
 static volatile uint32_t raw_arq_retransmits_received;
 
 /* Called from esb_ack_handler_cb (ISR context) when raw data packet arrives.
  * Updates gap queue and builds ACK payload with retransmit requests. */
-static void raw_arq_process_isr(uint16_t received_seq,
-				struct esb_payload *ack_payload,
-				bool *has_ack_payload)
+static void raw_arq_process_isr(uint16_t received_seq, struct esb_payload *ack_payload, bool *has_ack_payload)
 {
 	if (!raw_arq_seq_initialized) {
 		raw_arq_expected_seq = received_seq + 1;
@@ -847,10 +842,11 @@ static void raw_arq_process_isr(uint16_t received_seq,
 		/* Forward gap: diff packets missing */
 		uint8_t remaining = RAW_ARQ_MAX_GAPS - raw_arq_gap_count;
 		uint16_t to_add = (uint16_t)diff;
-		if (to_add > remaining) to_add = remaining;
+		if (to_add > remaining) {
+			to_add = remaining;
+		}
 		for (uint16_t i = 0; i < to_add; i++) {
-			raw_arq_gap_queue[raw_arq_gap_count++] =
-				(uint16_t)(expected + i);
+			raw_arq_gap_queue[raw_arq_gap_count++] = (uint16_t)(expected + i);
 		}
 		raw_arq_gaps_detected += (uint32_t)diff;
 		raw_arq_expected_seq = received_seq + 1;
@@ -858,10 +854,8 @@ static void raw_arq_process_isr(uint16_t received_seq,
 		/* Retransmitted (out-of-order) packet: remove from gap queue */
 		for (uint8_t i = 0; i < raw_arq_gap_count; i++) {
 			if (raw_arq_gap_queue[i] == received_seq) {
-				/* Shift remaining entries */
-				for (uint8_t j = i; j + 1 < raw_arq_gap_count; j++) {
-					raw_arq_gap_queue[j] = raw_arq_gap_queue[j + 1];
-				}
+				/* O(1) swap-delete — ISR must stay short */
+				raw_arq_gap_queue[i] = raw_arq_gap_queue[raw_arq_gap_count - 1];
 				raw_arq_gap_count--;
 				raw_arq_retransmits_received++;
 				break;
@@ -899,8 +893,7 @@ static void raw_arq_process_isr(uint16_t received_seq,
 		ack_payload->data[0] = RAW_ARQ_MARKER;
 		ack_payload->data[1] = n;
 		for (uint8_t i = 0; i < n; i++) {
-			sys_put_be16(raw_arq_gap_queue[i],
-				     &ack_payload->data[2 + i * 2]);
+			sys_put_be16(raw_arq_gap_queue[i], &ack_payload->data[2 + i * 2]);
 		}
 		*has_ack_payload = true;
 	} else {
@@ -924,9 +917,14 @@ static void raw_arq_reset(void)
  * Only reads pre-computed volatile state written by event_handler / threads.
  * No blocking, no logging, no locks.
  * -------------------------------------------------------------------------*/
-static void esb_ack_handler_cb(const uint8_t *pdu_data, uint8_t data_length,
-				uint32_t pipe_id, struct esb_payload *ack_payload,
-				bool *has_ack_payload, bool *suppress_ack)
+static void esb_ack_handler_cb(
+	const uint8_t *pdu_data,
+	uint8_t data_length,
+	uint32_t pipe_id,
+	struct esb_payload *ack_payload,
+	bool *has_ack_payload,
+	bool *suppress_ack
+)
 {
 	*has_ack_payload = false;
 	*suppress_ack = false;
@@ -1024,17 +1022,14 @@ static void esb_ack_handler_cb(const uint8_t *pdu_data, uint8_t data_length,
 		uint8_t cmd = tracker_remote_command[tracker_id];
 
 		/* In data collection mode, force SHUTDOWN for non-target trackers */
-		if (data_collect_is_active() &&
-		    !data_collect_is_target(tracker_id)) {
+		if (data_collect_is_active() && !data_collect_is_target(tracker_id)) {
 			cmd = ESB_PONG_FLAG_SHUTDOWN;
 		}
 
 		/* During active OTA, keep non-participating trackers suppressed.
 		 * This handles trackers that reboot mid-session (e.g. after a
 		 * previous batch completes) and reconnect without suppress. */
-		if (cmd == ESB_PONG_FLAG_NORMAL &&
-		    esb_ota_relay_is_active() &&
-		    !esb_ota_relay_is_target(tracker_id)) {
+		if (cmd == ESB_PONG_FLAG_NORMAL && esb_ota_relay_is_active() && !esb_ota_relay_is_target(tracker_id)) {
 			cmd = ESB_PONG_FLAG_OTA_SUPPRESS;
 		}
 
@@ -1087,28 +1082,24 @@ static void esb_ack_handler_cb(const uint8_t *pdu_data, uint8_t data_length,
 				/* Piggyback dynamic TDMA config in bytes 8-11.
 				 * Atomic 32-bit read on ARM Cortex-M — ISR safe. */
 				uint32_t cfg = tdma_config_packed[tracker_id];
-				ack_payload->data[8]  = (cfg >> 24) & 0xFF; /* assigned_slot */
-				ack_payload->data[9]  = (cfg >> 16) & 0xFF; /* total_slots */
-				ack_payload->data[10] = (cfg >> 8) & 0xFF;  /* slot_ticks */
-				ack_payload->data[11] = (cfg) & 0xFF;       /* config_epoch */
+				ack_payload->data[8] = (cfg >> 24) & 0xFF; /* assigned_slot */
+				ack_payload->data[9] = (cfg >> 16) & 0xFF; /* total_slots */
+				ack_payload->data[10] = (cfg >> 8) & 0xFF; /* slot_ticks */
+				ack_payload->data[11] = (cfg) & 0xFF;      /* config_epoch */
 			} else {
 				memset(&ack_payload->data[8], 0, 4);
 			}
 		}
 
-		ack_payload->data[ESB_PONG_LEN - 1] =
-			crc8_ccitt(0x07, ack_payload->data, ESB_PONG_LEN - 1);
+		ack_payload->data[ESB_PONG_LEN - 1] = crc8_ccitt(0x07, ack_payload->data, ESB_PONG_LEN - 1);
 		*has_ack_payload = true;
 
 		/* If OTA session has a pending command for this tracker
 		 * (e.g., BEGIN before tracker enters OTA mode), override
 		 * the standard PONG with the OTA payload. */
-		if (esb_ota_relay_is_active() &&
-		    esb_ota_relay_is_target(tracker_id)) {
+		if (esb_ota_relay_is_active() && esb_ota_relay_is_target(tracker_id)) {
 			bool ota_has_ack = false;
-			esb_ota_relay_fill_ack(tracker_id, pipe_id,
-					       ack_payload, &ota_has_ack,
-					       NULL, 0);
+			esb_ota_relay_fill_ack(tracker_id, pipe_id, ack_payload, &ota_has_ack, NULL, 0);
 			if (ota_has_ack) {
 				*has_ack_payload = true;
 			}
@@ -1121,18 +1112,14 @@ static void esb_ack_handler_cb(const uint8_t *pdu_data, uint8_t data_length,
 	/* ---- OTA status/poll packets from tracker in OTA mode ---- */
 	if (data_length >= 2 && pdu_data[0] == ESB_OTA_STATUS_TYPE) {
 		uint8_t tracker_id = pdu_data[1];
-		esb_ota_relay_fill_ack(tracker_id, pipe_id,
-				       ack_payload, has_ack_payload,
-				       pdu_data, data_length);
+		esb_ota_relay_fill_ack(tracker_id, pipe_id, ack_payload, has_ack_payload, pdu_data, data_length);
 		return;
 	}
 
 	/* ---- Raw data ARQ (type 0x10/0x13, data collection active) ---- */
-	if (data_length >= 4 &&
-	    (pdu_data[0] == ESB_RAW_IMU_TYPE || pdu_data[0] == ESB_RAW_IMU_QUAT_TYPE)) {
+	if (data_length >= 4 && (pdu_data[0] == ESB_RAW_IMU_TYPE || pdu_data[0] == ESB_RAW_IMU_QUAT_TYPE)) {
 		uint8_t tracker_id = pdu_data[1];
-		if (data_collect_is_active() &&
-		    data_collect_is_target(tracker_id)) {
+		if (data_collect_is_active() && data_collect_is_target(tracker_id)) {
 			uint16_t seq = sys_get_be16(&pdu_data[2]);
 			raw_arq_process_isr(seq, ack_payload, has_ack_payload);
 			if (*has_ack_payload) {
@@ -1240,6 +1227,19 @@ void event_handler(struct esb_evt const *event)
 				break;
 			} break;
 			case ESB_PING_LEN: {
+				/*
+				 * OTA STATUS/FW_INFO share PING length (13). Must not run PING
+				 * clock-bias / TDMA bookkeeping — STATUS bytes 3-6 are seq/bytes,
+				 * not expected_rx_ticks, and ~500 Hz polls would stretch EVENT IRQ
+				 * into ESB RX overflow during tracker OTA.
+				 */
+				if (rx_payload.data[0] == ESB_OTA_STATUS_TYPE ||
+				    rx_payload.data[0] == ESB_OTA_FW_INFO_TYPE) {
+					esb_ota_relay_process_tracker_packet(rx_payload.data,
+									     rx_payload.length);
+					break;
+				}
+
 				LOG_DBG(
 					"Received PING type=%u id=%u ctr=%u",
 					rx_payload.data[0],
@@ -1260,29 +1260,29 @@ void event_handler(struct esb_evt const *event)
 
 					/* Use RADIO ISR timestamp for clock_bias: avoids EVENT_IRQ scheduling
 					 * jitter (10-25 ticks) that would inflate bias and cause false violations. */
-					uint32_t isr_rx_ticks = g_ping_isr_rx_ticks_valid[tracker_id]
-						? g_ping_isr_rx_ticks[tracker_id] : current_rx_ticks;
+					uint32_t isr_rx_ticks
+						= g_ping_isr_rx_ticks_valid[tracker_id] ? g_ping_isr_rx_ticks[tracker_id] : current_rx_ticks;
 					int32_t rx_time_diff_ticks = (int32_t)(isr_rx_ticks - expected_rx_ticks);
 
-					/*
-					 * Rate-limited clock_bias update.
-					 *
-					 * PING retransmissions inflate rx_time_diff by 16-60+ ticks per
-					 * retry (ESB retransmit cycle ≈ 500-600 µs ≈ 16-20 ticks).
-					 * This inflated bias causes ALL data packets in the following
-					 * period to appear early (large negative Mean offset).
-					 *
-					 * Since retransmissions only INCREASE the measurement:
-					 * - Decreases: adopt immediately (clean PING measurement)
-					 * - Increases: cap at 2 ticks per PING period
-					 *
-					 * Real clock drift is <0.1 tick/second, so 2 ticks/PING easily
-					 * tracks legitimate drift while rejecting retransmission spikes
-					 * (a 400-tick spike only moves bias by 2 instead of 50).
-					 */
-					#define CLOCK_BIAS_MAX_UP_PER_PING 2
-					int32_t prev_bias = g_last_ping_rx_time_diff_valid[tracker_id]
-						? g_last_ping_rx_time_diff_ticks[tracker_id] : 0;
+/*
+ * Rate-limited clock_bias update.
+ *
+ * PING retransmissions inflate rx_time_diff by 16-60+ ticks per
+ * retry (ESB retransmit cycle ≈ 500-600 µs ≈ 16-20 ticks).
+ * This inflated bias causes ALL data packets in the following
+ * period to appear early (large negative Mean offset).
+ *
+ * Since retransmissions only INCREASE the measurement:
+ * - Decreases: adopt immediately (clean PING measurement)
+ * - Increases: cap at 2 ticks per PING period
+ *
+ * Real clock drift is <0.1 tick/second, so 2 ticks/PING easily
+ * tracks legitimate drift while rejecting retransmission spikes
+ * (a 400-tick spike only moves bias by 2 instead of 50).
+ */
+#define CLOCK_BIAS_MAX_UP_PER_PING 2
+					int32_t prev_bias
+						= g_last_ping_rx_time_diff_valid[tracker_id] ? g_last_ping_rx_time_diff_ticks[tracker_id] : 0;
 					if (!g_last_ping_rx_time_diff_valid[tracker_id]) {
 						g_last_ping_rx_time_diff_ticks[tracker_id] = rx_time_diff_ticks;
 					} else {
@@ -1331,16 +1331,22 @@ void event_handler(struct esb_evt const *event)
 					}
 					g_last_ping_isr_rx_ticks_raw[tracker_id] = isr_rx_ticks;
 
-					uint64_t rx_time_diff_us
-						= k_ticks_to_us_floor64((rx_time_diff_ticks < 0 ? -rx_time_diff_ticks : rx_time_diff_ticks));
-#if !TDMA_ENABLED
-					ARG_UNUSED(rx_time_diff_us);
-#endif
-					// Log periodically
-					int64_t now_ms = k_uptime_get();
-					if (stats->count > 0) {
+					/*
+					 * TDMA window log (Newton sqrt + UART) stays OFF the EVENT IRQ
+					 * path unless detailed stats are enabled — otherwise every PING
+					 * stretches IRQ latency and risks ESB RX FIFO overflow.
+					 */
+#if TDMA_ENABLED
+					if (stats->count > 0 && esb_get_stats_detailed_enabled()) {
+						uint64_t rx_time_diff_us = k_ticks_to_us_floor64(
+							(rx_time_diff_ticks < 0 ? -rx_time_diff_ticks : rx_time_diff_ticks)
+						);
 						int64_t mean = stats->sum_offset / stats->count;
-						uint64_t variance = (stats->sum_sq_offset / stats->count) - (mean * mean);
+						int64_t mean_sq = mean * mean;
+						uint64_t variance = 0;
+						if (stats->sum_sq_offset / stats->count >= (uint64_t)mean_sq) {
+							variance = (stats->sum_sq_offset / stats->count) - (uint64_t)mean_sq;
+						}
 						uint32_t std_dev = 0;
 						if (variance > 0) {
 							uint64_t s = variance / 2;
@@ -1357,8 +1363,7 @@ void event_handler(struct esb_evt const *event)
 							}
 						}
 
-#if TDMA_ENABLED
-						if (stats->violations > 12 && esb_get_stats_detailed_enabled()) {
+						if (stats->violations > 12) {
 							LOG_WRN(
 								"TDMA Stats ID=%u Count=%u Viol=%u Mean=%lld StdDev=%u EMA=%d "
 								"Range=[%d,%d] RxDiff=%s%llu us",
@@ -1373,34 +1378,20 @@ void event_handler(struct esb_evt const *event)
 								rx_time_diff_ticks >= 0 ? "+" : "-",
 								rx_time_diff_us
 							);
-						} else {
-							LOG_DBG(
-								"TDMA Stats ID=%u Count=%u Viol=%u Mean=%lld StdDev=%u EMA=%d "
-								"Range=[%d,%d] RxDiff=%s%llu us",
-								tracker_id,
-								stats->count,
-								stats->violations,
-								mean,
-								std_dev,
-								stats->phase_initialized ? (stats->phase_ema_q8 >> 8) : 0,
-								stats->min_offset,
-								stats->max_offset,
-								rx_time_diff_ticks >= 0 ? "+" : "-",
-								rx_time_diff_us
-							);
 						}
-#else
-						ARG_UNUSED(rx_time_diff_ticks);
-#endif
 					}
+#else
+					ARG_UNUSED(rx_time_diff_ticks);
+					ARG_UNUSED(stats);
+#endif
 
-					// Reset stats (preserve phase EMA across windows)
+					/* Always reset window counters; keep phase EMA. Cheap path. */
 					int32_t saved_ema = stats->phase_ema_q8;
 					bool saved_init = stats->phase_initialized;
 					memset(stats, 0, sizeof(struct tdma_stats));
 					stats->phase_ema_q8 = saved_ema;
 					stats->phase_initialized = saved_init;
-					stats->last_log_time = now_ms;
+					stats->last_log_time = k_uptime_get();
 				}
 
 				// Check for PING control packet and respond with PONG
@@ -1410,28 +1401,22 @@ void event_handler(struct esb_evt const *event)
 
 					uint8_t ping_ack_flag = rx_payload.data[7];
 
+					/* ack_handler clamps; this path must too before any [MAX_TRACKERS] index. */
+					if (tracker_id >= MAX_TRACKERS) {
+						break;
+					}
+
 					if (rx_payload.pipe != 1 + (tracker_id % 7)) {
 						static uint8_t pipe_mismatch_count[MAX_TRACKERS] = {0};
 						pipe_mismatch_count[tracker_id]++;
-
-						if (pipe_mismatch_count[tracker_id] % 10 == 1) {
-							LOG_WRN(
-								"PING pipe mismatch (x%u): id=%u, expected "
-								"pipe=%u got pipe=%u",
-								pipe_mismatch_count[tracker_id],
-								tracker_id,
-								1 + (tracker_id % 7),
-								rx_payload.pipe
-							);
-						} else {
-							LOG_DBG(
-								"PING pipe mismatch: id=%u, expected pipe=%u "
-								"got pipe=%u",
-								tracker_id,
-								1 + (tracker_id % 7),
-								rx_payload.pipe
-							);
-						}
+						LOG_DBG(
+							"PING pipe mismatch (x%u): id=%u, expected "
+							"pipe=%u got pipe=%u",
+							pipe_mismatch_count[tracker_id],
+							tracker_id,
+							1 + (tracker_id % 7),
+							rx_payload.pipe
+						);
 					}
 
 					// check crc for PING
@@ -1441,25 +1426,13 @@ void event_handler(struct esb_evt const *event)
 						static uint8_t crc_error_count[MAX_TRACKERS] = {0};
 						crc_error_count[tracker_id]++;
 
-						if (crc_error_count[tracker_id] % 5 == 1) {
-							// Log every 5th error
-							LOG_WRN(
-								"PING CRC mismatch (x%u): id=%u expected %02X "
-								"got %02X",
-								crc_error_count[tracker_id],
-								tracker_id,
-								crc_calc,
-								rx_payload.data[ESB_PING_LEN - 1]
-							);
-						} else {
-							LOG_DBG(
-								"PING CRC mismatch: id=%u expected %02X got "
-								"%02X",
-								tracker_id,
-								crc_calc,
-								rx_payload.data[ESB_PING_LEN - 1]
-							);
-						}
+						LOG_DBG(
+							"PING CRC mismatch (x%u): id=%u expected %02X got %02X",
+							crc_error_count[tracker_id],
+							tracker_id,
+							crc_calc,
+							rx_payload.data[ESB_PING_LEN - 1]
+						);
 						break;
 					}
 
@@ -1497,7 +1470,7 @@ void event_handler(struct esb_evt const *event)
 						// Check for timeout - if no PING received for more than 5 seconds, reset expectation
 						if (last_ping_time[tracker_id] > 0
 							&& (current_time - last_ping_time[tracker_id]) > PING_TIMEOUT_MS) {
-							LOG_INF(
+							LOG_WRN(
 								"PING timeout (%llu ms), resetting tracker %u counter tracking",
 								current_time - last_ping_time[tracker_id],
 								tracker_id
@@ -1531,7 +1504,7 @@ void event_handler(struct esb_evt const *event)
 								} else if (counter < 5) {
 									// Large backward step and small counter - possibly a restart
 									is_tracker_restart = true;
-									LOG_INF(
+									LOG_DBG(
 										"Tracker restart detected: id=%u old_ctr=%u new_ctr=%u (backward=%d)",
 										tracker_id,
 										last_ping_counter[tracker_id],
@@ -1541,7 +1514,7 @@ void event_handler(struct esb_evt const *event)
 								} else {
 									// Large backward step but counter not small - long packet loss + wrap-around
 									is_large_gap = true;
-									LOG_WRN(
+									LOG_DBG(
 										"Long packet loss with wraparound: id=%u last=%u new=%u (backward=%d, "
 										"accepting)",
 										tracker_id,
@@ -1615,12 +1588,16 @@ void event_handler(struct esb_evt const *event)
 					if (ping_ack_flag != ESB_PONG_FLAG_NORMAL) {
 						if (tracker_remote_command[tracker_id] == ping_ack_flag) {
 							tracker_remote_command[tracker_id] = ESB_PONG_FLAG_NORMAL;
+							/* Confirmations are frequent under load — keep UART off EVENT IRQ. */
 							LOG_DBG(
-								"Tracker %u confirmed command 0x%02X, clearing "
-								"flag",
+								"Tracker %u confirmed command %s (0x%02X)",
 								tracker_id,
+								esb_pong_flag_name(ping_ack_flag),
 								ping_ack_flag
 							);
+							if (remote_confirm_cb) {
+								remote_confirm_cb(tracker_id, ping_ack_flag);
+							}
 
 							if ((ping_ack_flag == ESB_PONG_FLAG_SET_CHANNEL
 								 || ping_ack_flag == ESB_PONG_FLAG_CLEAR_CHANNEL)
@@ -1630,7 +1607,7 @@ void event_handler(struct esb_evt const *event)
 								// could race with other trackers confirming concurrently.
 								atomic_val_t old_mask = atomic_or(&channel_ack_mask, (1 << tracker_id));
 								atomic_val_t new_mask = old_mask | (1 << tracker_id);
-								LOG_INF(
+								LOG_DBG(
 									"Tracker %u confirmed channel change "
 									"(%u/%u confirmed)",
 									tracker_id,
@@ -1644,15 +1621,8 @@ void event_handler(struct esb_evt const *event)
 					/* PONG is now built by ack_handler in radio ISR context.
 					 * event_handler only needs to track sequence state. */
 					last_pong_queued_counter[tracker_id] = counter;
-				} else {
-					/* Not a PING packet — check for OTA STATUS (same length) */
-					uint8_t pkt_type = rx_payload.data[0];
-					if (pkt_type == ESB_OTA_STATUS_TYPE ||
-					    pkt_type == ESB_OTA_FW_INFO_TYPE) {
-						esb_ota_relay_process_tracker_packet(
-							rx_payload.data, rx_payload.length);
-					}
 				}
+				/* Non-PING length-13 OTA types handled at case entry. */
 			} break;
 			case 17: // 16 bytes data + 1 byte sequence number
 			{
@@ -1702,14 +1672,11 @@ void event_handler(struct esb_evt const *event)
 				hid_write_packet_n(rx_payload.data,
 								   rx_payload.rssi); // write to hid endpoint
 			} break;
-			default:
-			{
+			default: {
 				/* OTA packets from tracker (status, firmware info) */
 				uint8_t pkt_type = rx_payload.data[0];
-				if (pkt_type == ESB_OTA_STATUS_TYPE ||
-				    pkt_type == ESB_OTA_FW_INFO_TYPE) {
-					esb_ota_relay_process_tracker_packet(
-						rx_payload.data, rx_payload.length);
+				if (pkt_type == ESB_OTA_STATUS_TYPE || pkt_type == ESB_OTA_FW_INFO_TYPE) {
+					esb_ota_relay_process_tracker_packet(rx_payload.data, rx_payload.length);
 					break;
 				}
 
@@ -1718,17 +1685,12 @@ void event_handler(struct esb_evt const *event)
 				 * Duplicate raw IMU packets (same tracker+sequence) are
 				 * dropped since trackers send each sample twice for
 				 * redundancy in noack mode. */
-				if (pkt_type == ESB_RAW_IMU_TYPE ||
-				    pkt_type == ESB_RAW_IMU_QUAT_TYPE ||
-				    pkt_type == ESB_RAW_MAG_TYPE ||
-				    pkt_type == ESB_RAW_META_TYPE ||
-				    pkt_type == ESB_RAW_CAL_TYPE) {
+				if (pkt_type == ESB_RAW_IMU_TYPE || pkt_type == ESB_RAW_IMU_QUAT_TYPE || pkt_type == ESB_RAW_MAG_TYPE
+					|| pkt_type == ESB_RAW_META_TYPE || pkt_type == ESB_RAW_CAL_TYPE) {
 					uint8_t tracker_id = rx_payload.data[1];
-					if (tracker_id < stored_trackers &&
-					    data_collect_is_target(tracker_id)) {
+					if (tracker_id < stored_trackers && data_collect_is_target(tracker_id)) {
 						/* Dedup raw IMU by tracker_id + sequence */
-						if (pkt_type == ESB_RAW_IMU_TYPE ||
-						    pkt_type == ESB_RAW_IMU_QUAT_TYPE) {
+						if (pkt_type == ESB_RAW_IMU_TYPE || pkt_type == ESB_RAW_IMU_QUAT_TYPE) {
 							static uint8_t last_raw_tracker = 0xFF;
 							static uint16_t last_raw_seq = 0xFFFF;
 							uint16_t seq = sys_get_be16(&rx_payload.data[2]);
@@ -1738,25 +1700,19 @@ void event_handler(struct esb_evt const *event)
 							last_raw_tracker = tracker_id;
 							last_raw_seq = seq;
 						}
-						data_collect_write(rx_payload.data,
-								   rx_payload.length,
-								   rx_payload.rssi);
-					} else if (tracker_id < stored_trackers &&
-						   !data_collect_is_active()) {
+						data_collect_write(rx_payload.data, rx_payload.length, rx_payload.rssi);
+					} else if (tracker_id < stored_trackers && !data_collect_is_active()) {
 						/* Tracker is still sending raw data but
 						 * receiver is not in collection mode (e.g.
 						 * receiver was unplugged and re-plugged).
 						 * Tell the tracker to stop collecting. */
-						if (tracker_remote_command[tracker_id] !=
-						    ESB_PONG_FLAG_DATA_COLLECT_OFF) {
-							esb_send_remote_command(
-								tracker_id,
-								ESB_PONG_FLAG_DATA_COLLECT_OFF);
+						if (tracker_remote_command[tracker_id] != ESB_PONG_FLAG_DATA_COLLECT_OFF) {
+							esb_send_remote_command(tracker_id, ESB_PONG_FLAG_DATA_COLLECT_OFF);
 						}
 					}
 					break;
 				}
-handle_composite_packet:
+			handle_composite_packet:
 				/* Composite packet (type ESB_COMPOSITE_TYPE): variable length.
 				 * Format: [ESB_COMPOSITE_TYPE][tracker_id][sub_count][sub_type0][sub_data0...]...[sequence]
 				 * Each sub-packet: 1 byte type + variable data.
@@ -1781,17 +1737,18 @@ handle_composite_packet:
 				/* Sequence byte is at the very end of the composite packet */
 				uint8_t received_sequence = rx_payload.data[rx_payload.length - 1];
 				int seq_result = check_packet_sequence(tracker_id, received_sequence);
+				/* seq_result: 0=normal, 1=potential loss, 2=out of order, 3=reboot, 4=duplicate */
+				if (seq_result == 4) {
+					LOG_WRN("TRK %d: Duplicate composite packet seq=%d, dropped", tracker_id, received_sequence);
+					break; /* duplicate */
+				}
 				if (seq_result == 2) {
-					LOG_WRN(
-						"TRK %d: Composite packet seq=%d is out-of-order, dropped",
-						tracker_id,
-						received_sequence
-					);
+					LOG_WRN("TRK %d: Composite packet seq=%d is out-of-order, dropped", tracker_id, received_sequence);
 					break; /* out-of-order */
 				}
 
 				/* Parse sub-packets and reconstruct standard 16-byte packets */
-				int pos = 3; /* skip header: type, id, sub_count */
+				int pos = 3;                     /* skip header: type, id, sub_count */
 				int end = rx_payload.length - 1; /* exclude sequence byte */
 
 				for (int i = 0; i < sub_count && pos < end; i++) {
@@ -1800,12 +1757,24 @@ handle_composite_packet:
 
 					/* Determine sub-packet data length */
 					switch (sub_type) {
-					case 0: sub_len = 13; break; /* info */
-					case 1: sub_len = 14; break; /* quat+accel */
-					case 2: sub_len = 13; break; /* compact quat */
-					case 3: sub_len = 2; break;  /* status */
-					case 4: sub_len = 14; break; /* quat+mag */
-					case 5: sub_len = 8; break;  /* runtime */
+					case 0:
+						sub_len = 13;
+						break; /* info */
+					case 1:
+						sub_len = 14;
+						break; /* quat+accel */
+					case 2:
+						sub_len = 13;
+						break; /* compact quat */
+					case 3:
+						sub_len = 2;
+						break; /* status */
+					case 4:
+						sub_len = 14;
+						break; /* quat+mag */
+					case 5:
+						sub_len = 8;
+						break; /* runtime */
 					default:
 						LOG_ERR("Unknown composite sub-type: %d", sub_type);
 						sub_len = -1;
@@ -2317,9 +2286,9 @@ bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_
 
 	int64_t now = k_uptime_get();
 	k_mutex_lock(&tracker_store_lock, K_FOREVER);
-	bool active = tracker_id < stored_trackers && stored_tracker_addr[tracker_id] != 0 &&
-		      tracker_stats[tracker_id].last_packet_time > 0 &&
-		      now - tracker_stats[tracker_id].last_packet_time <= PING_TIMEOUT_MS;
+	bool active = tracker_id < stored_trackers && stored_tracker_addr[tracker_id] != 0
+			   && tracker_stats[tracker_id].last_packet_time > 0
+			   && now - tracker_stats[tracker_id].last_packet_time <= PING_TIMEOUT_MS;
 	if (!active) {
 		k_mutex_unlock(&tracker_store_lock);
 		LOG_WRN("SENS_AUTO not queued for inactive tracker %u", tracker_id);
@@ -2338,8 +2307,9 @@ bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_
 	return true;
 }
 
-uint8_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions)
+uint32_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions)
 {
+	uint32_t mask = 0;
 	uint8_t count = 0;
 	int64_t scan_start_time = k_uptime_get();
 
@@ -2351,27 +2321,19 @@ uint8_t esb_send_remote_command_sens_auto_all(uint8_t axis, uint16_t revolutions
 			pending_sens_auto_axis[i] = axis;
 			pending_sens_auto_revolutions[i] = revolutions;
 			tracker_remote_command[i] = ESB_PONG_FLAG_SENS_AUTO;
+			mask |= (1u << i);
 			count++;
 		}
 	}
 	k_mutex_unlock(&tracker_store_lock);
 
 	if (revolutions == 0) {
-		LOG_INF(
-			"Queued SENS_AUTO for %u active trackers: axis=%u, revolutions=default",
-			count,
-			axis
-		);
+		LOG_INF("Queued SENS_AUTO for %u active trackers: axis=%u, revolutions=default", count, axis);
 	} else {
-		LOG_INF(
-			"Queued SENS_AUTO for %u active trackers: axis=%u, revolutions=%u",
-			count,
-			axis,
-			revolutions
-		);
+		LOG_INF("Queued SENS_AUTO for %u active trackers: axis=%u, revolutions=%u", count, axis, revolutions);
 	}
 
-	return count;
+	return mask;
 }
 
 void esb_send_remote_command_channel(uint8_t tracker_id, uint8_t channel)
@@ -2380,6 +2342,100 @@ void esb_send_remote_command_channel(uint8_t tracker_id, uint8_t channel)
 		tracker_remote_command[tracker_id] = ESB_PONG_FLAG_SET_CHANNEL;
 		tracker_channel_value = channel;
 		LOG_INF("Queued SET_CHANNEL %u for tracker %u", channel, tracker_id);
+	}
+}
+
+static const char *esb_pong_flag_name(uint8_t flag)
+{
+	switch (flag) {
+	case ESB_PONG_FLAG_NORMAL:
+		return "NORMAL";
+	case ESB_PONG_FLAG_SHUTDOWN:
+		return "SHUTDOWN";
+	case ESB_PONG_FLAG_CALIBRATE:
+		return "CALIBRATE";
+	case ESB_PONG_FLAG_SIX_SIDE_CAL:
+		return "SIX_SIDE_CAL";
+	case ESB_PONG_FLAG_MEOW:
+		return "MEOW";
+	case ESB_PONG_FLAG_SCAN:
+		return "SCAN";
+	case ESB_PONG_FLAG_MAG_CLEAR:
+		return "MAG_CLEAR";
+	case ESB_PONG_FLAG_MAG_CAL:
+		return "MAG_CAL";
+	case ESB_PONG_FLAG_MAG_ON:
+		return "MAG_ON";
+	case ESB_PONG_FLAG_MAG_OFF:
+		return "MAG_OFF";
+	case ESB_PONG_FLAG_MAG_AUTO_ON:
+		return "MAG_AUTO_ON";
+	case ESB_PONG_FLAG_MAG_AUTO_OFF:
+		return "MAG_AUTO_OFF";
+	case ESB_PONG_FLAG_REBOOT:
+		return "REBOOT";
+	case ESB_PONG_FLAG_CLEAR:
+		return "CLEAR";
+	case ESB_PONG_FLAG_DFU:
+		return "DFU";
+	case ESB_PONG_FLAG_DFU_OTA:
+		return "DFU_OTA";
+	case ESB_PONG_FLAG_SET_CHANNEL:
+		return "SET_CHANNEL";
+	case ESB_PONG_FLAG_CLEAR_CHANNEL:
+		return "CLEAR_CHANNEL";
+	case ESB_PONG_FLAG_SENS_SET:
+		return "SENS_SET";
+	case ESB_PONG_FLAG_SENS_RESET:
+		return "SENS_RESET";
+	case ESB_PONG_FLAG_SENS_AUTO:
+		return "SENS_AUTO";
+	case ESB_PONG_FLAG_RESET_ZRO:
+		return "RESET_ZRO";
+	case ESB_PONG_FLAG_RESET_ACC:
+		return "RESET_ACC";
+	case ESB_PONG_FLAG_RESET_BAT:
+		return "RESET_BAT";
+	case ESB_PONG_FLAG_PING:
+		return "PING";
+	case ESB_PONG_FLAG_RESET_TCAL:
+		return "RESET_TCAL";
+	case ESB_PONG_FLAG_TCAL_AUTO_ON:
+		return "TCAL_AUTO_ON";
+	case ESB_PONG_FLAG_TCAL_AUTO_OFF:
+		return "TCAL_AUTO_OFF";
+	case ESB_PONG_FLAG_FUSION_RESET:
+		return "FUSION_RESET";
+	case ESB_PONG_FLAG_TCAL_BOOT_ON:
+		return "TCAL_BOOT_ON";
+	case ESB_PONG_FLAG_TCAL_BOOT_OFF:
+		return "TCAL_BOOT_OFF";
+	case ESB_PONG_FLAG_TCAL_ON:
+		return "TCAL_ON";
+	case ESB_PONG_FLAG_TCAL_OFF:
+		return "TCAL_OFF";
+	case ESB_PONG_FLAG_TDMA_ON:
+		return "TDMA_ON";
+	case ESB_PONG_FLAG_TDMA_OFF:
+		return "TDMA_OFF";
+	case ESB_PONG_FLAG_TEST_MODE_ON:
+		return "TEST_MODE_ON";
+	case ESB_PONG_FLAG_TEST_MODE_OFF:
+		return "TEST_MODE_OFF";
+	case ESB_PONG_FLAG_DATA_COLLECT_ON:
+		return "DATA_COLLECT_ON";
+	case ESB_PONG_FLAG_DATA_COLLECT_OFF:
+		return "DATA_COLLECT_OFF";
+	case ESB_PONG_FLAG_OTA_QUERY_INFO:
+		return "OTA_QUERY_INFO";
+	case ESB_PONG_FLAG_OTA_ABORT:
+		return "OTA_ABORT";
+	case ESB_PONG_FLAG_OTA_SUPPRESS:
+		return "OTA_SUPPRESS";
+	case ESB_PONG_FLAG_OTA_UNSUPPRESS:
+		return "OTA_UNSUPPRESS";
+	default:
+		return "UNKNOWN";
 	}
 }
 
@@ -2394,247 +2450,21 @@ void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag)
 			raw_arq_reset();
 		}
 
-		const char *cmd_name = "UNKNOWN";
-		switch (command_flag) {
-		case ESB_PONG_FLAG_NORMAL:
-			cmd_name = "NORMAL";
-			break;
-		case ESB_PONG_FLAG_SHUTDOWN:
-			cmd_name = "SHUTDOWN";
-			break;
-		case ESB_PONG_FLAG_CALIBRATE:
-			cmd_name = "CALIBRATE";
-			break;
-		case ESB_PONG_FLAG_SIX_SIDE_CAL:
-			cmd_name = "SIX_SIDE_CAL";
-			break;
-		case ESB_PONG_FLAG_MEOW:
-			cmd_name = "MEOW";
-			break;
-		case ESB_PONG_FLAG_SCAN:
-			cmd_name = "SCAN";
-			break;
-		case ESB_PONG_FLAG_MAG_CLEAR:
-			cmd_name = "MAG_CLEAR";
-			break;
-		case ESB_PONG_FLAG_MAG_CAL:
-			cmd_name = "MAG_CAL";
-			break;
-		case ESB_PONG_FLAG_MAG_ON:
-			cmd_name = "MAG_ON";
-			break;
-		case ESB_PONG_FLAG_MAG_OFF:
-			cmd_name = "MAG_OFF";
-			break;
-		case ESB_PONG_FLAG_REBOOT:
-			cmd_name = "REBOOT";
-			break;
-		case ESB_PONG_FLAG_CLEAR:
-			cmd_name = "CLEAR";
-			break;
-		case ESB_PONG_FLAG_DFU:
-			cmd_name = "DFU";
-			break;
-		case ESB_PONG_FLAG_DFU_OTA:
-			cmd_name = "DFU_OTA";
-			break;
-		case ESB_PONG_FLAG_SET_CHANNEL:
-			cmd_name = "SET_CHANNEL";
-			break;
-		case ESB_PONG_FLAG_SENS_SET:
-			cmd_name = "SENS_SET";
-			break;
-		case ESB_PONG_FLAG_SENS_RESET:
-			cmd_name = "SENS_RESET";
-			break;
-		case ESB_PONG_FLAG_SENS_AUTO:
-			cmd_name = "SENS_AUTO";
-			break;
-		case ESB_PONG_FLAG_RESET_ZRO:
-			cmd_name = "RESET_ZRO";
-			break;
-		case ESB_PONG_FLAG_RESET_ACC:
-			cmd_name = "RESET_ACC";
-			break;
-		case ESB_PONG_FLAG_RESET_BAT:
-			cmd_name = "RESET_BAT";
-			break;
-		case ESB_PONG_FLAG_PING:
-			cmd_name = "PING";
-			break;
-		case ESB_PONG_FLAG_RESET_TCAL:
-			cmd_name = "RESET_TCAL";
-			break;
-		case ESB_PONG_FLAG_TCAL_ON:
-			cmd_name = "TCAL_ON";
-			break;
-		case ESB_PONG_FLAG_TCAL_OFF:
-			cmd_name = "TCAL_OFF";
-			break;
-		case ESB_PONG_FLAG_TCAL_AUTO_ON:
-			cmd_name = "TCAL_AUTO_ON";
-			break;
-		case ESB_PONG_FLAG_TCAL_AUTO_OFF:
-			cmd_name = "TCAL_AUTO_OFF";
-			break;
-		case ESB_PONG_FLAG_FUSION_RESET:
-			cmd_name = "FUSION_RESET";
-			break;
-		case ESB_PONG_FLAG_TCAL_BOOT_ON:
-			cmd_name = "TCAL_BOOT_ON";
-			break;
-		case ESB_PONG_FLAG_TCAL_BOOT_OFF:
-			cmd_name = "TCAL_BOOT_OFF";
-			break;
-		case ESB_PONG_FLAG_TDMA_ON:
-			cmd_name = "TDMA_ON";
-			break;
-		case ESB_PONG_FLAG_TDMA_OFF:
-			cmd_name = "TDMA_OFF";
-			break;
-		case ESB_PONG_FLAG_TEST_MODE_ON:
-			cmd_name = "TEST_MODE_ON";
-			break;
-		case ESB_PONG_FLAG_TEST_MODE_OFF:
-			cmd_name = "TEST_MODE_OFF";
-			break;
-		case ESB_PONG_FLAG_DATA_COLLECT_ON:
-			cmd_name = "DATA_COLLECT_ON";
-			break;
-		case ESB_PONG_FLAG_DATA_COLLECT_OFF:
-			cmd_name = "DATA_COLLECT_OFF";
-			break;
-		case ESB_PONG_FLAG_OTA_QUERY_INFO:
-			cmd_name = "OTA_QUERY_INFO";
-			break;
-		case ESB_PONG_FLAG_OTA_ABORT:
-			cmd_name = "OTA_ABORT";
-			break;
-		case ESB_PONG_FLAG_OTA_SUPPRESS:
-			cmd_name = "OTA_SUPPRESS";
-			break;
-		case ESB_PONG_FLAG_OTA_UNSUPPRESS:
-			cmd_name = "OTA_UNSUPPRESS";
-			break;
-		}
-		LOG_INF("Remote command %s (0x%02X) queued for tracker %d", cmd_name, command_flag, tracker_id);
+		LOG_INF("Remote command %s (0x%02X) queued for tracker %d", esb_pong_flag_name(command_flag),
+			command_flag, tracker_id);
 	} else {
 		LOG_ERR("Invalid tracker ID: %d", tracker_id);
 	}
 }
 
 // Send remote command to all paired trackers
-void esb_send_remote_command_all(uint8_t command_flag)
+uint32_t esb_send_remote_command_all(uint8_t command_flag)
 {
+	uint32_t mask = 0;
 	uint8_t count = 0;
 	int64_t scan_start_time = k_uptime_get();
 	char active_tracker_ids[(MAX_TRACKERS * 4) + 1];
 	size_t active_tracker_ids_len = 0;
-	const char *cmd_name = "UNKNOWN";
-	switch (command_flag) {
-	case ESB_PONG_FLAG_NORMAL:
-		cmd_name = "NORMAL";
-		break;
-	case ESB_PONG_FLAG_SHUTDOWN:
-		cmd_name = "SHUTDOWN";
-		break;
-	case ESB_PONG_FLAG_CALIBRATE:
-		cmd_name = "CALIBRATE";
-		break;
-	case ESB_PONG_FLAG_SIX_SIDE_CAL:
-		cmd_name = "SIX_SIDE_CAL";
-		break;
-	case ESB_PONG_FLAG_MEOW:
-		cmd_name = "MEOW";
-		break;
-	case ESB_PONG_FLAG_SCAN:
-		cmd_name = "SCAN";
-		break;
-	case ESB_PONG_FLAG_MAG_CLEAR:
-		cmd_name = "MAG_CLEAR";
-		break;
-	case ESB_PONG_FLAG_MAG_CAL:
-		cmd_name = "MAG_CAL";
-		break;
-	case ESB_PONG_FLAG_MAG_ON:
-		cmd_name = "MAG_ON";
-		break;
-	case ESB_PONG_FLAG_MAG_OFF:
-		cmd_name = "MAG_OFF";
-		break;
-	case ESB_PONG_FLAG_REBOOT:
-		cmd_name = "REBOOT";
-		break;
-	case ESB_PONG_FLAG_CLEAR:
-		cmd_name = "CLEAR";
-		break;
-	case ESB_PONG_FLAG_DFU:
-		cmd_name = "DFU";
-		break;
-	case ESB_PONG_FLAG_DFU_OTA:
-		cmd_name = "DFU_OTA";
-		break;
-	case ESB_PONG_FLAG_SET_CHANNEL:
-		cmd_name = "SET_CHANNEL";
-		break;
-	case ESB_PONG_FLAG_SENS_SET:
-		cmd_name = "SENS_SET";
-		break;
-	case ESB_PONG_FLAG_SENS_RESET:
-		cmd_name = "SENS_RESET";
-		break;
-	case ESB_PONG_FLAG_SENS_AUTO:
-		cmd_name = "SENS_AUTO";
-		break;
-	case ESB_PONG_FLAG_RESET_ZRO:
-		cmd_name = "RESET_ZRO";
-		break;
-	case ESB_PONG_FLAG_RESET_ACC:
-		cmd_name = "RESET_ACC";
-		break;
-	case ESB_PONG_FLAG_RESET_BAT:
-		cmd_name = "RESET_BAT";
-		break;
-	case ESB_PONG_FLAG_PING:
-		cmd_name = "PING";
-		break;
-	case ESB_PONG_FLAG_RESET_TCAL:
-		cmd_name = "RESET_TCAL";
-		break;
-	case ESB_PONG_FLAG_TCAL_ON:
-		cmd_name = "TCAL_ON";
-		break;
-	case ESB_PONG_FLAG_TCAL_OFF:
-		cmd_name = "TCAL_OFF";
-		break;
-	case ESB_PONG_FLAG_TCAL_AUTO_ON:
-		cmd_name = "TCAL_AUTO_ON";
-		break;
-	case ESB_PONG_FLAG_TCAL_AUTO_OFF:
-		cmd_name = "TCAL_AUTO_OFF";
-		break;
-	case ESB_PONG_FLAG_FUSION_RESET:
-		cmd_name = "FUSION_RESET";
-		break;
-	case ESB_PONG_FLAG_TCAL_BOOT_ON:
-		cmd_name = "TCAL_BOOT_ON";
-		break;
-	case ESB_PONG_FLAG_TCAL_BOOT_OFF:
-		cmd_name = "TCAL_BOOT_OFF";
-		break;
-	case ESB_PONG_FLAG_TDMA_ON:
-		cmd_name = "TDMA_ON";
-		break;
-	case ESB_PONG_FLAG_TDMA_OFF:
-		cmd_name = "TDMA_OFF";
-		break;
-	case ESB_PONG_FLAG_TEST_MODE_ON:
-		cmd_name = "TEST_MODE_ON";
-		break;
-	case ESB_PONG_FLAG_TEST_MODE_OFF:
-		cmd_name = "TEST_MODE_OFF";
-		break;
-	}
 
 	k_msleep(REMOTE_COMMAND_ACTIVE_SCAN_MS);
 
@@ -2642,6 +2472,7 @@ void esb_send_remote_command_all(uint8_t command_flag)
 	for (uint8_t i = 0; i < stored_trackers && i < MAX_TRACKERS; i++) {
 		if (stored_tracker_addr[i] != 0 && tracker_stats[i].last_packet_time >= scan_start_time) {
 			tracker_remote_command[i] = command_flag;
+			mask |= (1u << i);
 			if (active_tracker_ids_len < sizeof(active_tracker_ids)) {
 				int written = snprintk(
 					&active_tracker_ids[active_tracker_ids_len],
@@ -2650,7 +2481,8 @@ void esb_send_remote_command_all(uint8_t command_flag)
 					i
 				);
 				if (written > 0) {
-					active_tracker_ids_len += MIN((size_t)written, sizeof(active_tracker_ids) - active_tracker_ids_len - 1);
+					active_tracker_ids_len
+						+= MIN((size_t)written, sizeof(active_tracker_ids) - active_tracker_ids_len - 1);
 				}
 			}
 			count++;
@@ -2664,12 +2496,13 @@ void esb_send_remote_command_all(uint8_t command_flag)
 
 	LOG_INF(
 		"Remote command %s (0x%02X) queued for %d active trackers after %d ms scan; active IDs: %s",
-		cmd_name,
+		esb_pong_flag_name(command_flag),
 		command_flag,
 		count,
 		REMOTE_COMMAND_ACTIVE_SCAN_MS,
 		count > 0 ? active_tracker_ids : "none"
 	);
+	return mask;
 }
 
 // Manually print statistics for all active trackers
@@ -2732,17 +2565,35 @@ uint32_t esb_get_stats_detailed_remaining(void)
 	return (uint32_t)(remaining / 1000);
 }
 
+void esb_set_channel_change_done_cb(esb_channel_change_done_cb_t cb)
+{
+	channel_change_done_cb = cb;
+}
+
+void esb_set_remote_confirm_cb(esb_remote_confirm_cb_t cb)
+{
+	remote_confirm_cb = cb;
+}
+
+static void channel_change_finish(bool success)
+{
+	atomic_set(&channel_change_pending, 0);
+	if (channel_change_done_cb) {
+		channel_change_done_cb(success);
+	}
+}
+
 // Sets the RF channel for all trackers
-void esb_set_all_trackers_channel(uint8_t channel)
+int esb_set_all_trackers_channel(uint8_t channel)
 {
 	if (channel < 1 || channel > 100) {
 		LOG_ERR("Invalid channel value: %u (must be 1-100)", channel);
-		return;
+		return -EINVAL;
 	}
 
 	if (atomic_get(&channel_change_pending)) {
 		LOG_WRN("Channel change already in progress, please wait");
-		return;
+		return -EBUSY;
 	}
 
 	tracker_channel_value = channel;
@@ -2755,14 +2606,15 @@ void esb_set_all_trackers_channel(uint8_t channel)
 
 	esb_send_remote_command_all(ESB_PONG_FLAG_SET_CHANNEL);
 	LOG_INF("RF channel %u command sent to all trackers, waiting for confirmation...", channel);
+	return 0;
 }
 
 // Clear RF channel settings for all trackers (restore to default)
-void esb_clear_all_trackers_channel(void)
+int esb_clear_all_trackers_channel(void)
 {
 	if (atomic_get(&channel_change_pending)) {
 		LOG_WRN("Channel change already in progress, please wait");
-		return;
+		return -EBUSY;
 	}
 
 	pending_channel = 0xFF; // Special value to indicate clearing
@@ -2774,6 +2626,7 @@ void esb_clear_all_trackers_channel(void)
 
 	esb_send_remote_command_all(ESB_PONG_FLAG_CLEAR_CHANNEL);
 	LOG_INF("CLEAR_CHANNEL command sent to all trackers, waiting for confirmation...");
+	return 0;
 }
 
 // Set the receiver's RF channel (local, does not affect trackers)
@@ -2825,7 +2678,6 @@ uint8_t esb_get_receiver_channel(void)
 void esb_receive(void)
 {
 	esb_set_addr_unified();
-	esb_paired = true;
 }
 
 // NVS writer thread: processes async NVS write requests
@@ -2834,7 +2686,6 @@ static void nvs_writer_thread(void)
 	struct nvs_write_request req;
 	while (1) {
 		k_msgq_get(&nvs_write_msgq, &req, K_FOREVER);
-		k_msleep(5); // Simulate async write delay
 		sys_write(req.id, NULL, req.data, req.len);
 	}
 }
@@ -2868,9 +2719,6 @@ static void esb_thread(void)
 		}
 	}
 
-	if (tracker_count) {
-		esb_paired = true;
-	}
 	LOG_INF("%d/%d devices stored", tracker_count, MAX_TRACKERS);
 
 	/* Pre-fill TDMA config based on stored tracker count so trackers
@@ -2879,24 +2727,30 @@ static void esb_thread(void)
 	if (tracker_count > 0) {
 		uint8_t init_slot;
 		uint16_t tps = (tracker_count <= 3) ? TDMA_TPS_TIER_HIGH
-		             : (tracker_count <= 5) ? TDMA_TPS_TIER_MID_H
-		             : (tracker_count <= 6) ? TDMA_TPS_TIER_MID
-		             : TDMA_TPS_TIER_LOW;
+					 : (tracker_count <= 5) ? TDMA_TPS_TIER_MID_H
+					 : (tracker_count <= 6) ? TDMA_TPS_TIER_MID
+											: TDMA_TPS_TIER_LOW;
 		uint32_t denom = (uint32_t)tps * tracker_count;
 		init_slot = (uint8_t)((32768 + denom - 1) / denom);
-		if (init_slot < TDMA_MIN_EFF_SLOT) init_slot = TDMA_MIN_EFF_SLOT;
+		if (init_slot < TDMA_MIN_EFF_SLOT) {
+			init_slot = TDMA_MIN_EFF_SLOT;
+		}
 		tdma_config_epoch++;
 		for (uint8_t i = 0; i < tracker_count && i < MAX_TRACKERS; i++) {
-			tdma_config_packed[i] = tdma_pack_config(
-				i, tracker_count, init_slot, tdma_config_epoch);
+			tdma_config_packed[i] = tdma_pack_config(i, tracker_count, init_slot, tdma_config_epoch);
 		}
 		tdma_dynamic_active_count = tracker_count;
 		tdma_dynamic_slot_ticks = init_slot;
 		tdma_active_mask = (1U << tracker_count) - 1;
 		uint32_t init_frame = (uint32_t)init_slot * tracker_count;
-		LOG_INF("TDMA initial: %u stored, slot=%u, frame=%u, ~%u TPS (epoch=%u)",
-			tracker_count, init_slot, init_frame,
-			init_frame > 0 ? 32768 / init_frame : 0, tdma_config_epoch);
+		LOG_INF(
+			"TDMA initial: %u stored, slot=%u, frame=%u, ~%u TPS (epoch=%u)",
+			tracker_count,
+			init_slot,
+			init_frame,
+			init_frame > 0 ? 32768 / init_frame : 0,
+			tdma_config_epoch
+		);
 	}
 
 	// Cache receiver device address for ISR pairing responses
@@ -2941,8 +2795,11 @@ static void esb_thread(void)
 					if (pairing_target_reached_time == 0) {
 						pairing_target_reached_time = k_uptime_get();
 						pairing_new_devices_blocked = true; // Block new devices, allow re-pairing only
-						LOG_INF("Pairing target count reached (%u new devices), exiting in %d seconds...",
-							new_devices, PAIRING_EXIT_DELAY_MS / 1000);
+						LOG_INF(
+							"Pairing target count reached (%u new devices), exiting in %d seconds...",
+							new_devices,
+							PAIRING_EXIT_DELAY_MS / 1000
+						);
 					}
 					// Check if delay has passed
 					int64_t elapsed_since_target = k_uptime_get() - pairing_target_reached_time;
@@ -2993,7 +2850,7 @@ static void esb_thread(void)
 					LOG_INF("Receiver channel switched to %u successfully", receiver_rf_channel);
 				}
 
-				atomic_set(&channel_change_pending, 0);
+				channel_change_finish(true);
 			} else if (now >= channel_change_timeout) {
 				// Timeout, cancel channel change
 				LOG_WRN(
@@ -3001,8 +2858,8 @@ static void esb_thread(void)
 					__builtin_popcount(current_mask),
 					stored_trackers
 				);
-				atomic_set(&channel_change_pending, 0);
 				tracker_channel_value = 0; // Reset pending channel value
+				channel_change_finish(false);
 			}
 		}
 

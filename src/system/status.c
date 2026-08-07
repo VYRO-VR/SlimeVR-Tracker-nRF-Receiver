@@ -32,7 +32,8 @@ static int status_state = 0;
 LOG_MODULE_REGISTER(status, LOG_LEVEL_INF);
 
 static void status_thread(void);
-K_THREAD_DEFINE(status_thread_id, 256, status_thread, NULL, NULL, NULL, 6, 0, 0);
+/* below ESB_THREAD_PRIORITY; keep equal with led/button */
+K_THREAD_DEFINE(status_thread_id, 256, status_thread, NULL, NULL, NULL, STATUS_THREAD_PRIORITY, 0, 0);
 
 void set_status(enum sys_status status, bool set) {
 	if (set) {

@@ -20,14 +20,9 @@
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 	THE SOFTWARE.
 */
-#ifndef SLIMENRF_HID
-#define SLIMENRF_HID
+#ifndef SLIMENRF_CONSOLE_SEND_H
+#define SLIMENRF_CONSOLE_SEND_H
 
-#include <stdint.h>
-
-void hid_write_packet_n(const uint8_t *data, uint8_t rssi);
-uint32_t hid_get_current_tps(void);
-void hid_reset_rssi_smooth(uint8_t tracker_id);
-void hid_reset_all_rssi_smooth(void);
+void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *arg5);
 
 #endif

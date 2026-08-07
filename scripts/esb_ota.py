@@ -91,6 +91,7 @@ TERMINAL_STATUSES = {
     OTA_STATUS_BOARD_MISMATCH,
     OTA_STATUS_SIZE_ERROR,
     OTA_STATUS_FLASH_ERROR,
+    OTA_STATUS_SEQ_ERROR,
 }
 
 # ── OTA Protocol Constants ──────────────────────────────────────────
@@ -98,7 +99,7 @@ TERMINAL_STATUSES = {
 OTA_PROTOCOL_VERSION = 1
 OTA_DATA_MAX_PAYLOAD = 60  # Max firmware bytes per data packet
 OTA_BOARD_TARGET_MAX = 48
-RING_BUFFER_SIZE     = 127  # Receiver ring buffer capacity
+RING_BUFFER_SIZE     = 128  # Must match firmware OTA_TX_RING_SIZE
 RECEIVER_OTA_ID      = 0xFE  # tracker_id for receiver self-OTA
 
 

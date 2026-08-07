@@ -17,8 +17,8 @@ Binary framing protocol (from receiver):
 Packet types in payload:
   0x10: Raw IMU (48 bytes) - float gyro+accel (+optional body-frame aligned mag) + T-Cal temp
   0x11: Raw Mag (17 bytes) - float body-frame aligned magnetometer
-  0x12: Metadata (48 bytes) - ODR, range, sensor IDs (sent once)
-  0x13: Raw IMU + gyrQuat (52 bytes) - accumulated gyro quaternion + accel/body-frame aligned mag
+  meta: raw TX Hz, optional chip/fusion Hz after mag_id
+  gyrQuat: accumulated gyro quaternion + accel/body-frame aligned mag
 
 Output: CSV file with columns depending on mode:
   raw mode:      seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp
@@ -51,16 +51,18 @@ def crc8_ccitt(data: bytes, init: int = 0x07) -> int:
 
 
 class SensorMetadata:
-    """Stores metadata from type 0x12 packet."""
+    """Stores fields from a raw metadata packet."""
 
     def __init__(self):
         self.gyro_range = 0.0
         self.accel_range = 0.0
-        self.gyro_odr = 0.0
+        self.gyro_odr = 0.0  # raw TX Hz (prepare timebase)
         self.accel_odr = 0.0
         self.mag_odr = 0.0
         self.imu_id = 0
         self.mag_id = 0
+        self.gyro_chip_odr = None  # optional trailer when >0
+        self.gyro_fusion_odr = None  # optional trailer when >0
         self.received = False
 
     def parse(self, payload: bytes):
@@ -73,19 +75,36 @@ class SensorMetadata:
         self.mag_odr = struct.unpack_from("<f", payload, 18)[0]
         self.imu_id = payload[22]
         self.mag_id = payload[23]
+        self.gyro_chip_odr = None
+        self.gyro_fusion_odr = None
+        if len(payload) >= 28:
+            chip = struct.unpack_from("<f", payload, 24)[0]
+            if math.isfinite(chip) and chip > 0:
+                self.gyro_chip_odr = chip
+                if len(payload) >= 32:
+                    fusion = struct.unpack_from("<f", payload, 28)[0]
+                    if math.isfinite(fusion) and fusion > 0:
+                        self.gyro_fusion_odr = fusion
         self.received = True
 
     def __str__(self):
-        return (
-            f"Gyro: {self.gyro_range:.0f} dps @ {self.gyro_odr:.0f} Hz, "
+        parts = [
+            f"Gyro: {self.gyro_range:.0f} dps send@{self.gyro_odr:.0f} Hz",
+        ]
+        if self.gyro_chip_odr is not None:
+            parts[0] += f" chip@{self.gyro_chip_odr:.0f} Hz"
+        if self.gyro_fusion_odr is not None:
+            parts[0] += f" fusion@{self.gyro_fusion_odr:.0f} Hz"
+        parts.append(
             f"Accel: {self.accel_range:.0f} g @ {self.accel_odr:.0f} Hz, "
             f"Mag: {self.mag_odr:.0f} Hz, "
             f"IMU ID: {self.imu_id}, Mag ID: {self.mag_id}"
         )
+        return ", ".join(parts)
 
 
 class CalibrationData:
-    """Stores calibration data from type 0x14 packets."""
+    """Stores calibration data from raw cal packets."""
 
     def __init__(self):
         self.accel_BAinv = None
@@ -118,7 +137,7 @@ class CalibrationData:
         return [deduped[key] for key in sorted(deduped, key=lambda k: float(k))]
 
     def parse(self, payload: bytes):
-        """Parse a type 0x14 calibration packet. Sub-type at byte[2]."""
+        """Parse a calibration packet. Sub-type at byte[2]."""
         if len(payload) < 4:
             return
         sub_type = payload[2]
@@ -206,7 +225,7 @@ class CalibrationData:
 
 
 def parse_raw_imu(payload: bytes, meta: SensorMetadata):
-    """Parse type 0x10 raw IMU packet (float format, no timestamp). Returns a single sample dict."""
+    """Parse legacy raw IMU packet (float format, no timestamp). Returns a single sample dict."""
     if len(payload) < 42:
         return None
 
@@ -240,7 +259,7 @@ def parse_raw_imu(payload: bytes, meta: SensorMetadata):
 
 
 def parse_raw_imu_quat(payload: bytes, meta: SensorMetadata):
-    """Parse type 0x13 raw IMU + gyrQuat packet (52 bytes). Returns sample dict."""
+    """Parse raw IMU + gyrQuat packet. Returns sample dict."""
     if len(payload) < 46:
         return None
 
@@ -270,7 +289,7 @@ def parse_raw_imu_quat(payload: bytes, meta: SensorMetadata):
 
 
 def parse_raw_mag(payload: bytes, _meta: SensorMetadata):
-    """Parse type 0x11 raw mag packet (float format)."""
+    """Parse legacy raw mag packet (float format)."""
     if len(payload) < 16:
         return None
 
@@ -361,7 +380,7 @@ def collect(port, output_path, duration=None):
     last_rssi = 0
     retransmit_count = 0
     gap_count = 0  # sequence gaps never filled (actual loss)
-    data_mode = "raw"  # will switch to "gyr_quat" if type 0x13 packets arrive
+    data_mode = "raw"  # switches to "gyr_quat" when gyrQuat packets arrive
     meta_written = False  # metadata file written once on first IMU data
 
     # Reorder buffer for ARQ retransmits
@@ -411,6 +430,10 @@ def collect(port, output_path, duration=None):
                         f.write(f"gyro_range_dps={meta.gyro_range}\n")
                         f.write(f"accel_range_g={meta.accel_range}\n")
                         f.write(f"gyro_odr_hz={meta.gyro_odr}\n")
+                        if meta.gyro_chip_odr is not None:
+                            f.write(f"gyro_chip_odr_hz={meta.gyro_chip_odr}\n")
+                        if meta.gyro_fusion_odr is not None:
+                            f.write(f"gyro_fusion_odr_hz={meta.gyro_fusion_odr}\n")
                         f.write(f"accel_odr_hz={meta.accel_odr}\n")
                         f.write(f"mag_odr_hz={meta.mag_odr}\n")
                         f.write(f"imu_id={meta.imu_id}\n")

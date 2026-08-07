@@ -27,6 +27,8 @@
 #include <zephyr/usb/usb_ch9.h>
 #include <zephyr/usb/usbd.h>
 
+#include "thread_priority.h"
+
 LOG_MODULE_REGISTER(usb, LOG_LEVEL_INF);
 
 #define SLIMEVR_USB_STRING_MANUFACTURER_IDX 1U
@@ -265,4 +267,5 @@ static void usb_init_thread(void)
 	}
 }
 
-K_THREAD_DEFINE(usb_init_thread_id, 256, usb_init_thread, NULL, NULL, NULL, 6, 0, 500);
+/* below ESB_THREAD_PRIORITY; one-shot USB init must not outrank radio */
+K_THREAD_DEFINE(usb_init_thread_id, 256, usb_init_thread, NULL, NULL, NULL, USB_INIT_THREAD_PRIORITY, 0, 500);

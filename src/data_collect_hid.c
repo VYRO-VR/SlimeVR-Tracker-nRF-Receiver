@@ -238,8 +238,24 @@ static K_WORK_DEFINE(dc_timeout_work, dc_timeout_work_handler);
 static void dc_timeout_timer_handler(struct k_timer *timer)
 {
 	ARG_UNUSED(timer);
+	int64_t now = k_uptime_get();
+
+	if (dc_active && now - dc_last_stats_time >= DC_STATS_INTERVAL_MS) {
+		uint32_t period_sent = dc_frames_sent - dc_last_stats_sent;
+		uint32_t period_dropped = dc_frames_dropped - dc_last_stats_dropped;
+		uint32_t period_received = dc_frames_received - dc_last_stats_received;
+
+		LOG_INF("DC: rcv=%u/3s sent=%u/3s drop=%u/3s (total sent=%u drop=%u)",
+			period_received, period_sent, period_dropped,
+			dc_frames_sent, dc_frames_dropped);
+		dc_last_stats_time = now;
+		dc_last_stats_sent = dc_frames_sent;
+		dc_last_stats_dropped = dc_frames_dropped;
+		dc_last_stats_received = dc_frames_received;
+	}
+
 	if (dc_active && dc_last_rx_time > 0 &&
-	    (k_uptime_get() - dc_last_rx_time) > DC_TIMEOUT_MS) {
+	    (now - dc_last_rx_time) > DC_TIMEOUT_MS) {
 		k_work_submit(&dc_timeout_work);
 	}
 }
@@ -281,21 +297,7 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 
 	dc_last_rx_time = k_uptime_get();
 	dc_frames_received++;
-
-	/* Periodic stats (every 3 seconds) */
-	int64_t now = k_uptime_get();
-	if (now - dc_last_stats_time >= DC_STATS_INTERVAL_MS) {
-		uint32_t period_sent = dc_frames_sent - dc_last_stats_sent;
-		uint32_t period_dropped = dc_frames_dropped - dc_last_stats_dropped;
-		uint32_t period_received = dc_frames_received - dc_last_stats_received;
-		LOG_INF("DC: rcv=%u/3s sent=%u/3s drop=%u/3s (total sent=%u drop=%u)",
-			period_received, period_sent, period_dropped,
-			dc_frames_sent, dc_frames_dropped);
-		dc_last_stats_time = now;
-		dc_last_stats_sent = dc_frames_sent;
-		dc_last_stats_dropped = dc_frames_dropped;
-		dc_last_stats_received = dc_frames_received;
-	}
+	/* Stats LOG lives in send work — not EVENT IRQ. */
 
 	if (!dc_hid_ready) {
 		dc_frames_dropped++;
@@ -342,14 +344,30 @@ void data_collect_start(uint8_t tracker_id)
 	dc_last_stats_dropped = 0;
 	dc_last_stats_received = 0;
 	dc_last_rx_time = k_uptime_get();
-	/* Reset FIFO */
-	atomic_set(&dc_fifo_write, 0);
-	atomic_set(&dc_fifo_read, 0);
-	dc_submitted_report = NULL;
-	/* Clear busy flag to ensure endpoint is ready */
-	atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
-	if (dc_hid_ready) {
-		k_work_submit(&dc_send_work);
+
+	/* Wait briefly for in-flight USB report before resetting FIFO.
+	 * Clearing indices/busy while submit is outstanding lets done_cb
+	 * advance a rewound read pointer and corrupt the ring. */
+	bool idle = false;
+	for (int i = 0; i < 20; i++) {
+		if (dc_submitted_report == NULL &&
+		    !atomic_test_bit(dc_ep_busy, DC_EP_BUSY_FLAG)) {
+			idle = true;
+			break;
+		}
+		k_msleep(1);
+	}
+
+	if (idle) {
+		atomic_set(&dc_fifo_write, 0);
+		atomic_set(&dc_fifo_read, 0);
+		dc_submitted_report = NULL;
+		atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
+		if (dc_hid_ready) {
+			k_work_submit(&dc_send_work);
+		}
+	} else {
+		LOG_WRN("Data collect start: endpoint busy, keeping FIFO");
 	}
 	LOG_INF("Data collection STARTED for tracker %u (HID)", tracker_id);
 }
