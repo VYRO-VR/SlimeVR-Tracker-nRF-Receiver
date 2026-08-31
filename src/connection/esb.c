@@ -87,11 +87,29 @@ bool esb_channel_is_allowed(uint8_t channel)
 // Guarded-PING TDMA: every active tracker owns one base slot per frame. A
 // synchronized PING uses its own slot plus the following slot; every tracker
 // derives and observes the same guard schedule.
+//
+// ping_guard_v2: the slot width is adaptive instead of fixed 16 ticks. With
+// few trackers the per-frame opportunity rate (32768/(sticks*N)) far exceeds
+// the ~220 TPS of useful demand, so slots are widened for admission-window
+// robustness; the loss controller below trades rate for stability by stepping
+// the per-tracker opportunity cap down a ladder (never below ~115 TPS).
 #define TDMA_ENABLED 1
 #define TDMA_BASE_SLOT_TICKS 16
+#define TDMA_SLOT_TICKS_MAX_LEVEL0 64
 #define TDMA_TOLERANCE_TICKS 3
 #define TDMA_SLOT_ROTATION 0
 #define TDMA_RECONFIG_MIN_MS 5000 /* minimum interval between TDMA reconfigurations */
+/* Loss ladder: sustained aggregate sequence-gap loss steps the opportunity
+ * cap down; sustained clean loss steps back up. Values are opportunities/s
+ * per tracker; sticks is the widest even width keeping opp >= cap. */
+static const uint16_t tdma_cap_ladder[] = {220, 180, 150, 130, 115};
+#define TDMA_CAP_LEVEL_MAX (ARRAY_SIZE(tdma_cap_ladder) - 1U)
+#define TDMA_LOSS_TRIGGER_PERMILLE 50  /* >5% aggregate gap loss */
+#define TDMA_LOSS_TRIGGER_WINDOWS 5    /* ...for 5 consecutive 1 s windows */
+#define TDMA_LOSS_RECOVER_PERMILLE 10  /* <1% aggregate gap loss */
+#define TDMA_LOSS_RECOVER_WINDOWS 30   /* ...for 30 consecutive 1 s windows */
+#define TDMA_LOSS_MIN_SAMPLES 100 /* enough evidence at the 115 TPS floor */
+#define TDMA_LOSS_RECONFIG_MIN_MS 15000 /* min spacing between ladder steps */
 #define TDMA_SYNC_EXTRAP_MAX_TICKS (10u * 32768u) /* skip frozen-skew extrapolation beyond this PING age */
 #define PING_CLEAN_REACQUIRE_STREAK 8u            /* consecutive dirty PINGs before re-baselining */
 
@@ -103,6 +121,18 @@ static uint8_t tdma_dynamic_active_count; // current number of active trackers
 static uint8_t tdma_dynamic_slot_ticks;   // current slot width in ticks
 static uint32_t tdma_active_mask;         // bitmask of active trackers (for change detection)
 static int64_t tdma_last_reconfig_time;   // timestamp of last reconfiguration (0 = never)
+/* Loss-controller state, evaluated once per 1 s stats tick. */
+static uint8_t tdma_cap_level;             /* index into tdma_cap_ladder */
+static uint8_t tdma_loss_trigger_streak;   /* consecutive lossy 1 s windows */
+static uint8_t tdma_published_cap_level;   /* level in effect in the live layout */
+static uint8_t tdma_loss_recover_streak;   /* consecutive clean 1 s windows */
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+static int64_t tdma_last_loss_step_ms;   /* last applied ladder step (log only) */
+static uint32_t tdma_loss_last_permille; /* last judged window (log only) */
+#endif
+static uint32_t tdma_prev_recv[MAX_TRACKERS];
+static uint32_t tdma_prev_gaps[MAX_TRACKERS];
+
 
 static inline uint32_t tdma_pack_config(uint8_t slot, uint8_t total, uint8_t slot_ticks, uint8_t epoch)
 {
@@ -114,6 +144,7 @@ static void tdma_recalculate(void);
 static void tdma_stats_reset(void);
 static void tdma_sync_stats_reset(void);
 
+static void tdma_loss_controller_tick(int64_t now);
 static struct esb_payload rx_payload;
 
 struct pairing_event {
@@ -280,6 +311,7 @@ static void tdma_shadow_update(uint32_t now_ms)
 	atomic_set(&tdma_shadow_pending_leave_mask, (atomic_val_t)pending_leave_mask);
 }
 
+
 #define TEST_ALL_RATE_QUANTUM_TPS 10U
 #define TEST_ALL_JOIN_CONFIG_GRACE_MS 1500
 
@@ -288,7 +320,12 @@ static uint16_t test_all_capacity_tps(uint8_t active_count)
 	if (active_count == 0) {
 		return 1000;
 	}
-	uint16_t capacity = (uint16_t)(32768U / (TDMA_BASE_SLOT_TICKS * active_count));
+	/* Capacity follows the *actual* layout: ping_guard_v2 widens slots when
+	 * trackers are few, so fixed TDMA_BASE_SLOT_TICKS math would overestimate
+	 * achievable TPS. Test-all forces sticks back to 16 (max rate), but during
+	 * the layout transition the current width is the truth. */
+	uint8_t sticks = tdma_dynamic_slot_ticks > 0 ? tdma_dynamic_slot_ticks : TDMA_BASE_SLOT_TICKS;
+	uint16_t capacity = (uint16_t)(32768U / ((uint32_t)sticks * active_count));
 	uint16_t clamped = (capacity / TEST_ALL_RATE_QUANTUM_TPS) * TEST_ALL_RATE_QUANTUM_TPS;
 	return clamped > 0 ? clamped : 1;
 }
@@ -434,6 +471,28 @@ static void test_all_reconcile(int64_t now)
 	);
 }
 
+/* Widest even slot width (ticks) that keeps per-tracker opportunity rate at
+ * or above the current ladder cap: sticks <= 32768/(N*cap) is equivalent to
+ * 32768/(sticks*N) >= cap. Level 0 clamps width to 64 ticks so normal mode
+ * always holds comfortable headroom above the ~220 TPS useful demand; deeper
+ * loss levels may widen up to the protocol byte limit to deliberately trade
+ * rate for stability. Test-all measures raw throughput, so it forces the
+ * narrowest (max-rate) layout. */
+static uint8_t tdma_slot_ticks_for(uint8_t active_count)
+{
+	if (active_count == 0) {
+		return TDMA_BASE_SLOT_TICKS;
+	}
+	if (atomic_get(&test_all_enabled)) {
+		return TDMA_BASE_SLOT_TICKS;
+	}
+	uint32_t cap = tdma_cap_ladder[tdma_cap_level];
+	uint32_t max_sticks = 32768U / ((uint32_t)active_count * cap);
+	uint32_t width_limit = tdma_cap_level == 0 ? TDMA_SLOT_TICKS_MAX_LEVEL0 : 255U;
+	uint32_t sticks = MIN(max_sticks, width_limit) & ~1U;
+	return (uint8_t)MAX(sticks, TDMA_BASE_SLOT_TICKS);
+}
+
 /**
  * Recalculate dynamic TDMA parameters based on active trackers.
  * Called periodically from esb_stats_thread (non-ISR context).
@@ -460,18 +519,40 @@ static void tdma_recalculate(void)
 		}
 	}
 
-	/* Skip update if active set hasn't changed */
-	if (new_mask == tdma_active_mask && active_count == tdma_dynamic_active_count) {
+	bool mask_changed = new_mask != tdma_active_mask;
+	if (mask_changed) {
+		/* Membership churn restarts loss learning: the old ladder level
+		 * described a different layout and tracker mix. */
+		tdma_cap_level = 0;
+		tdma_loss_trigger_streak = 0;
+		tdma_loss_recover_streak = 0;
+	}
+	uint8_t slot_ticks = tdma_slot_ticks_for(active_count);
+	bool test_all_layout = atomic_get(&test_all_enabled) != 0;
+
+	/* No layout update is needed when a ladder level maps to the same physical
+	 * width (for example many-tracker layouts already pinned at 16 ticks).
+	 * Do not acknowledge a pending loss level while test-all is masking it
+	 * behind a forced 16-tick layout. */
+	if (!mask_changed && slot_ticks == tdma_dynamic_slot_ticks) {
+		if (!test_all_layout) {
+			tdma_published_cap_level = tdma_cap_level;
+		}
 		return;
 	}
-
-	/* Debounce membership churn. A marginal tracker oscillating around the
-	 * 15 s leave-grace boundary used to republish a new layout (new epoch,
-	 * shifted slots, reset diagnostics) every few seconds. Hold each layout
-	 * for at least TDMA_RECONFIG_MIN_MS; the flags thread re-runs this
-	 * every second, so a deferred transition simply applies on a later tick. */
+	/* Debounce reconfiguration. Membership churn: a marginal tracker
+	 * oscillating around the 15 s leave-grace boundary used to republish a
+	 * new layout (new epoch, shifted slots, reset diagnostics) every few
+	 * seconds. Loss-ladder steps reconfigure even more rarely so repeated
+	 * layout transitions cannot add loss on top of the condition being
+	 * treated; membership churn and test-all rate forcing use the short
+	 * interval. This thread re-runs every second, so a deferred transition
+	 * simply applies on a later tick. */
+	bool ladder_step = tdma_cap_level != tdma_published_cap_level;
+	uint32_t min_reconfig_ms = (mask_changed || test_all_layout || !ladder_step)
+		? TDMA_RECONFIG_MIN_MS : TDMA_LOSS_RECONFIG_MIN_MS;
 	if (tdma_last_reconfig_time != 0 &&
-		now - tdma_last_reconfig_time < TDMA_RECONFIG_MIN_MS) {
+		now - tdma_last_reconfig_time < min_reconfig_ms) {
 		return;
 	}
 
@@ -479,11 +560,10 @@ static void tdma_recalculate(void)
 	if (active_count == 0) {
 		tdma_active_mask = 0;
 		tdma_dynamic_active_count = 0;
+		tdma_dynamic_slot_ticks = TDMA_BASE_SLOT_TICKS;
+		tdma_published_cap_level = tdma_cap_level;
 		return;
 	}
-
-
-	uint8_t slot_ticks = TDMA_BASE_SLOT_TICKS;
 
 	tdma_config_epoch++;
 	uint8_t epoch = tdma_config_epoch;
@@ -503,27 +583,37 @@ static void tdma_recalculate(void)
 	}
 	test_all_note_layout(old_mask, new_mask, (int64_t)now);
 
-	uint8_t old_count = tdma_dynamic_active_count;
-	uint8_t old_slot = tdma_dynamic_slot_ticks;
 	tdma_dynamic_active_count = active_count;
 	tdma_dynamic_slot_ticks = slot_ticks;
 	tdma_active_mask = new_mask;
 	test_all_update_effective(active_count, (int64_t)now, true);
 	tdma_last_reconfig_time = now;
+	if (mask_changed || !test_all_layout) {
+		tdma_published_cap_level = tdma_cap_level;
+	}
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	if (ladder_step && !test_all_layout) {
+		tdma_last_loss_step_ms = (int64_t)now;
+	}
+#endif
 
-	/* Log on any mask change, not just count changes: knowing WHICH tracker
-	 * joined/left is what makes churn diagnosable from field logs. */
-	if (new_mask != old_mask || active_count != old_count || slot_ticks != old_slot) {
+	/* Log on any change: knowing WHICH tracker joined/left or WHICH ladder
+	 * step applied is what makes churn diagnosable from field logs. */
+	{
 		uint32_t frame_ticks = (uint32_t)slot_ticks * active_count;
 		uint32_t est_tps = frame_ticks > 0 ? 32768 / frame_ticks : 0;
 		LOG_INF(
-			"TDMA reconfig: mode=ping_guard_v1 rotation=%u active=%u base_slot=%u frame=%u opportunity=%u/trk aggregate=%u/s epoch=%u members=0x%04x",
+			"TDMA reconfig: mode=ping_guard_v2 reason=%s rotation=%u active=%u slot=%u frame=%u opportunity=%u/trk aggregate=%u/s cap=%u lvl=%u/%u epoch=%u members=0x%04x",
+			mask_changed ? "membership" : (test_all_layout ? "test_all" : "loss_ladder"),
 			TDMA_SLOT_ROTATION,
 			active_count,
 			slot_ticks,
 			frame_ticks,
 			est_tps,
 			32768 / slot_ticks,
+			tdma_cap_ladder[tdma_cap_level],
+			tdma_cap_level,
+			(uint8_t)TDMA_CAP_LEVEL_MAX,
 			epoch,
 			new_mask
 		);
@@ -686,6 +776,109 @@ static void tdma_sync_stats_reset(void)
 	memset(g_ping_dirty_streak, 0, sizeof(g_ping_dirty_streak));
 	memset(g_ping_reject_count, 0, sizeof(g_ping_reject_count));
 	memset(g_extrap_skip_count, 0, sizeof(g_extrap_skip_count));
+}
+
+/* Aggregate loss ladder controller. Runs once per 1 s stats tick, before
+ * tdma_recalculate(). Metric: sequence-gap share of received+gaps over all
+ * active trackers — a CRC-destroyed packet also surfaces as a sequence gap,
+ * so this is end-to-end data loss. A sustained >5% window steps the cap down
+ * one ladder level; 30 s of <1% steps back up. tdma_recalculate() owns the
+ * reconfiguration debounce and publication. */
+static void tdma_loss_controller_tick(int64_t now)
+{
+	ARG_UNUSED(now);
+
+	uint32_t recv = 0;
+	uint32_t gaps = 0;
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		uint32_t r = tracker_stats[i].total_received;
+		uint32_t g = tracker_stats[i].total_gaps;
+		uint32_t prev_r = tdma_prev_recv[i];
+		uint32_t prev_g = tdma_prev_gaps[i];
+		tdma_prev_recv[i] = r;
+		tdma_prev_gaps[i] = g;
+		/* Monotonic counters; inactive trackers and a console stats reset
+		 * (counters jump backward) resync silently and contribute nothing. */
+		if (!(tdma_active_mask & BIT(i)) || r < prev_r || g < prev_g) {
+			continue;
+		}
+		uint32_t delta_recv = r - prev_r;
+		uint32_t delta_gaps = g - prev_g;
+		if (delta_recv + delta_gaps == 0) {
+			continue;
+		}
+		recv += delta_recv;
+		gaps += delta_gaps;
+	}
+
+	/* Always advance snapshots above. Otherwise leaving an excluded mode would
+	 * collapse its entire accumulated traffic into one fake 1 s loss window. */
+	if (data_collect_is_active() || esb_ota_relay_is_active()
+	    || (atomic_get(&test_all_state_valid) && atomic_get(&test_all_enabled))) {
+		tdma_loss_trigger_streak = 0;
+		tdma_loss_recover_streak = 0;
+		return;
+	}
+
+	/* A requested level must be published (or acknowledged as a physical
+	 * no-op) before another step can be requested. This prevents a 15 s
+	 * reconfiguration debounce from accumulating three 5 s down-steps. */
+	if (tdma_cap_level != tdma_published_cap_level) {
+		return;
+	}
+
+	uint32_t samples = recv + gaps;
+	if (samples < TDMA_LOSS_MIN_SAMPLES) {
+		/* Insufficient evidence breaks consecutiveness; it must not bridge a
+		 * quiet interval between otherwise lossy or clean windows. */
+		tdma_loss_trigger_streak = 0;
+		tdma_loss_recover_streak = 0;
+		return;
+	}
+	uint32_t loss_permille = gaps * 1000U / samples;
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	tdma_loss_last_permille = loss_permille;
+#endif
+	if (loss_permille > TDMA_LOSS_TRIGGER_PERMILLE) {
+		if (tdma_loss_trigger_streak < TDMA_LOSS_TRIGGER_WINDOWS) {
+			tdma_loss_trigger_streak++;
+		}
+		tdma_loss_recover_streak = 0;
+	} else if (loss_permille < TDMA_LOSS_RECOVER_PERMILLE) {
+		if (tdma_loss_recover_streak < TDMA_LOSS_RECOVER_WINDOWS) {
+			tdma_loss_recover_streak++;
+		}
+		tdma_loss_trigger_streak = 0;
+	} else {
+		tdma_loss_trigger_streak = 0;
+		tdma_loss_recover_streak = 0;
+	}
+
+	if (tdma_loss_trigger_streak >= TDMA_LOSS_TRIGGER_WINDOWS
+	    && tdma_cap_level < TDMA_CAP_LEVEL_MAX) {
+		tdma_cap_level++;
+		tdma_loss_trigger_streak = 0;
+		LOG_WRN(
+			"TDMA loss ladder DOWN: lvl=%u/%u cap=%u loss=%u.%u%% recv=%u gaps=%u",
+			tdma_cap_level,
+			(uint8_t)TDMA_CAP_LEVEL_MAX,
+			tdma_cap_ladder[tdma_cap_level],
+			loss_permille / 10,
+			loss_permille % 10,
+			recv,
+			gaps
+		);
+	} else if (tdma_loss_recover_streak >= TDMA_LOSS_RECOVER_WINDOWS
+		   && tdma_cap_level > 0) {
+		tdma_cap_level--;
+		tdma_loss_recover_streak = 0;
+		LOG_INF(
+			"TDMA loss ladder UP: lvl=%u/%u cap=%u",
+			tdma_cap_level,
+			(uint8_t)TDMA_CAP_LEVEL_MAX,
+			tdma_cap_ladder[tdma_cap_level]
+		);
+	}
 }
 
 #if TDMA_ENABLED
@@ -1135,6 +1328,7 @@ static void esb_stats_thread(void)
 
 			/* Recalculate dynamic TDMA config every TPS print cycle (~1s) */
 			tdma_shadow_update((uint32_t)now);
+			tdma_loss_controller_tick(now);
 			tdma_recalculate();
 			test_all_reconcile((int64_t)now);
 		}
@@ -3153,7 +3347,7 @@ void esb_print_health_snapshot(void)
 
 	uint32_t desired_mask = (uint32_t)atomic_get(&tdma_shadow_desired_mask);
 	LOG_INF(
-		"HEALTH TDMA source=data_ping_shadow stored=%u active=%u mask=0x%04x desired=0x%04x recent=0x%04x slot=%u epoch=%u TPS=%u HID=%u recv=%u gaps=%u hid_drop_total=%u",
+		"HEALTH TDMA source=data_ping_shadow stored=%u active=%u mask=0x%04x desired=0x%04x recent=0x%04x slot=%u epoch=%u TPS=%u HID=%u recv=%u gaps=%u hid_drop_total=%u cap=%u lvl=%u/%u loss_pm=%u trig=%u rec=%u step_ms=%lld",
 		stored_trackers,
 		tdma_dynamic_active_count,
 		(unsigned int)tdma_active_mask,
@@ -3165,7 +3359,14 @@ void esb_print_health_snapshot(void)
 		hid_get_current_tps(),
 		total_received,
 		total_gaps,
-		hid_get_total_drop_count()
+		hid_get_total_drop_count(),
+		tdma_cap_ladder[tdma_cap_level],
+		tdma_cap_level,
+		(uint8_t)TDMA_CAP_LEVEL_MAX,
+		tdma_loss_last_permille,
+		tdma_loss_trigger_streak,
+		tdma_loss_recover_streak,
+		tdma_last_loss_step_ms
 	);
 	LOG_INF("HEALTH observed=0x%04x", (unsigned int)observed_mask);
 	uint32_t now_ms = (uint32_t)now;
@@ -3279,6 +3480,14 @@ void esb_reset_all_stats(void)
 		last_pong_queued_counter[i] = 0;
 	}
 	tdma_sync_stats_reset();
+	tdma_loss_trigger_streak = 0;
+	tdma_loss_recover_streak = 0;
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	tdma_last_loss_step_ms = 0;
+	tdma_loss_last_permille = 0;
+#endif
+	memset(tdma_prev_recv, 0, sizeof(tdma_prev_recv));
+	memset(tdma_prev_gaps, 0, sizeof(tdma_prev_gaps));
 	LOG_INF("All packet statistics have been reset");
 }
 // Toggle detailed statistics display on/off
