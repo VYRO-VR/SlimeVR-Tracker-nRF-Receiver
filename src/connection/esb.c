@@ -163,9 +163,12 @@ static bool ping_counter_initialized[MAX_TRACKERS]
 static uint64_t last_ping_time[MAX_TRACKERS] = {0}; // Track the last time a PING was received from each tracker
 static uint8_t last_pong_queued_counter[MAX_TRACKERS] = {0}; // Track the last PONG counter enqueued for each tracker
 static uint8_t packet_count[MAX_TRACKERS] = {0};             // Packet count received from each tracker
+static uint16_t last_raw_seq[MAX_TRACKERS] = {0};
+static bool last_raw_valid[MAX_TRACKERS] = {false};
 // Shared ACK state: written by threads/event_handler, read by ack_handler (radio ISR).
 // On single-core Cortex-M, volatile ensures visibility between ISR priorities.
 static volatile uint8_t tracker_remote_command[MAX_TRACKERS]; // Command flag for next PONG
+static volatile uint8_t pending_cmd_arg[MAX_TRACKERS];       // Optional byte carried in PONG data[8]
 static volatile uint32_t tracker_channel_value;               // Channel value for SET_CHANNEL command
 static volatile uint16_t tracker_test_on_tps[MAX_TRACKERS];   // Optional TPS carried by TEST_MODE_ON
 static volatile int16_t pending_sens_data[MAX_TRACKERS][3];   // SENS_SET sensitivity data
@@ -1580,16 +1583,17 @@ static void esb_ack_handler_cb(
 			return;
 		}
 
+		uint8_t counter = pdu_data[2];
+		uint8_t cmd = tracker_remote_command[tracker_id];
+
 		uint32_t rx_ticks = k_uptime_ticks();
 		/* Save accurate RADIO ISR timestamp for clock_bias computation in event_handler */
 		g_ping_isr_rx_ticks[tracker_id] = rx_ticks;
 		g_ping_isr_rx_ticks_valid[tracker_id] = true;
 
-		uint8_t counter = pdu_data[2];
-		uint8_t cmd = tracker_remote_command[tracker_id];
-
-		/* In data collection mode, force SHUTDOWN for non-target trackers */
-		if (data_collect_is_active() && !data_collect_is_target(tracker_id)) {
+		/* In single-target data collection mode, force SHUTDOWN for non-target trackers. */
+		if (data_collect_is_active() && !data_collect_is_target(tracker_id)
+			&& !data_collect_batch_is_active()) {
 			cmd = ESB_PONG_FLAG_SHUTDOWN;
 		}
 
@@ -1650,14 +1654,18 @@ static void esb_ack_handler_cb(
 				ack_payload->data[9] = tracker_test_on_tps[tracker_id] & 0xFF;
 				ack_payload->data[10] = 0;
 				ack_payload->data[11] = 0;
+			} else if (cmd == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) {
+				ack_payload->data[8] = pending_cmd_arg[tracker_id];
+				ack_payload->data[9] = 0;
+				ack_payload->data[10] = 0;
+				ack_payload->data[11] = 0;
 			} else if (cmd == ESB_PONG_FLAG_NORMAL) {
-				/* Piggyback dynamic TDMA config in bytes 8-11.
-				 * Atomic 32-bit read on ARM Cortex-M — ISR safe. */
+				/* Piggyback dynamic TDMA config in bytes 8-11. */
 				uint32_t cfg = tdma_config_packed[tracker_id];
-				ack_payload->data[8] = (cfg >> 24) & 0xFF; /* assigned_slot */
-				ack_payload->data[9] = (cfg >> 16) & 0xFF; /* total_slots */
-				ack_payload->data[10] = (cfg >> 8) & 0xFF; /* slot_ticks */
-				ack_payload->data[11] = (cfg) & 0xFF;      /* config_epoch */
+				ack_payload->data[8] = (cfg >> 24) & 0xFF;
+				ack_payload->data[9] = (cfg >> 16) & 0xFF;
+				ack_payload->data[10] = (cfg >> 8) & 0xFF;
+				ack_payload->data[11] = (cfg) & 0xFF;
 			} else {
 				memset(&ack_payload->data[8], 0, 4);
 			}
@@ -1688,12 +1696,11 @@ static void esb_ack_handler_cb(
 		return;
 	}
 
-	/* ---- Raw data ARQ (type 0x10/0x13, data collection active) ---- */
+	/* ---- Raw data ARQ (type 0x10/0x13, single-target collection only) ---- */
 	if (data_length >= 4 && (pdu_data[0] == ESB_RAW_IMU_TYPE || pdu_data[0] == ESB_RAW_IMU_QUAT_TYPE)) {
 		uint8_t tracker_id = pdu_data[1];
-		if (data_collect_is_active() && data_collect_is_target(tracker_id)) {
-			uint16_t seq = sys_get_be16(&pdu_data[2]);
-			raw_arq_process_isr(seq, ack_payload, has_ack_payload);
+		if (data_collect_is_target(tracker_id) && !data_collect_batch_is_target(tracker_id)) {
+			raw_arq_process_isr(sys_get_be16(&pdu_data[2]), ack_payload, has_ack_payload);
 			if (*has_ack_payload) {
 				ack_payload->pipe = pipe_id;
 			}
@@ -2163,9 +2170,12 @@ void event_handler(struct esb_evt const *event)
 					if (ping_ack_flag != ESB_PONG_FLAG_NORMAL) {
 						uint16_t ping_ack_tps = ping_ack_flag == ESB_PONG_FLAG_TEST_MODE_ON
 							? ((uint16_t)rx_payload.data[8] << 8) | rx_payload.data[9] : 0;
-						bool payload_matches = ping_ack_flag != ESB_PONG_FLAG_TEST_MODE_ON
+						bool test_payload_matches = ping_ack_flag != ESB_PONG_FLAG_TEST_MODE_ON
 							|| ping_ack_tps == tracker_test_on_tps[tracker_id];
-						if (tracker_remote_command[tracker_id] == ping_ack_flag && payload_matches) {
+						bool batch_payload_matches = ping_ack_flag != ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON
+							|| rx_payload.data[8] == pending_cmd_arg[tracker_id];
+						if (tracker_remote_command[tracker_id] == ping_ack_flag
+						    && test_payload_matches && batch_payload_matches) {
 							tracker_remote_command[tracker_id] = ESB_PONG_FLAG_NORMAL;
 							/* Confirmations are frequent under load — keep UART off EVENT IRQ. */
 							LOG_DBG(
@@ -2284,33 +2294,29 @@ void event_handler(struct esb_evt const *event)
 					break;
 				}
 
-				/* Raw data collection packets (types 0x10-0x13): variable length.
-				 * Forward raw payload to CDC for PC-side data collection.
-				 * Duplicate raw IMU packets (same tracker+sequence) are
-				 * dropped since trackers send each sample twice for
-				 * redundancy in noack mode. */
+				/* Raw data collection packets (types 0x10-0x13): variable length. */
 				if (pkt_type == ESB_RAW_IMU_TYPE || pkt_type == ESB_RAW_IMU_QUAT_TYPE || pkt_type == ESB_RAW_MAG_TYPE
 					|| pkt_type == ESB_RAW_META_TYPE || pkt_type == ESB_RAW_CAL_TYPE) {
 					uint8_t tracker_id = rx_payload.data[1];
-					if (tracker_id < stored_trackers && data_collect_is_target(tracker_id)) {
-						/* Dedup raw IMU by tracker_id + sequence */
+					if (tracker_id >= stored_trackers || tracker_id >= MAX_TRACKERS) {
+						break;
+					}
+					bool is_target = data_collect_is_target(tracker_id)
+						|| data_collect_batch_is_target(tracker_id);
+					if (is_target) {
 						if (pkt_type == ESB_RAW_IMU_TYPE || pkt_type == ESB_RAW_IMU_QUAT_TYPE) {
-							static uint8_t last_raw_tracker = 0xFF;
-							static uint16_t last_raw_seq = 0xFFFF;
 							uint16_t seq = sys_get_be16(&rx_payload.data[2]);
-							if (tracker_id == last_raw_tracker && seq == last_raw_seq) {
-								break; /* duplicate */
+							if (last_raw_valid[tracker_id] && last_raw_seq[tracker_id] == seq) {
+								break;
 							}
-							last_raw_tracker = tracker_id;
-							last_raw_seq = seq;
+							last_raw_seq[tracker_id] = seq;
+							last_raw_valid[tracker_id] = true;
 						}
 						data_collect_write(rx_payload.data, rx_payload.length, rx_payload.rssi);
-					} else if (tracker_id < stored_trackers && !data_collect_is_active()) {
-						/* Tracker is still sending raw data but
-						 * receiver is not in collection mode (e.g.
-						 * receiver was unplugged and re-plugged).
-						 * Tell the tracker to stop collecting. */
-						if (tracker_remote_command[tracker_id] != ESB_PONG_FLAG_DATA_COLLECT_OFF) {
+					} else if (!data_collect_is_active() && !data_collect_batch_is_active()) {
+						uint8_t pending = tracker_remote_command[tracker_id];
+						if (pending != ESB_PONG_FLAG_DATA_COLLECT_OFF &&
+						    pending != ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF) {
 							esb_send_remote_command(tracker_id, ESB_PONG_FLAG_DATA_COLLECT_OFF);
 						}
 					}
@@ -3204,6 +3210,10 @@ static const char *esb_pong_flag_name(uint8_t flag)
 		return "DATA_COLLECT_ON";
 	case ESB_PONG_FLAG_DATA_COLLECT_OFF:
 		return "DATA_COLLECT_OFF";
+	case ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON:
+		return "DATA_COLLECT_BATCH_ON";
+	case ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF:
+		return "DATA_COLLECT_BATCH_OFF";
 	case ESB_PONG_FLAG_OTA_QUERY_INFO:
 		return "OTA_QUERY_INFO";
 	case ESB_PONG_FLAG_OTA_ABORT:
@@ -3220,20 +3230,23 @@ static const char *esb_pong_flag_name(uint8_t flag)
 // Send remote command to specified tracker
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag)
 {
-	if (tracker_id < MAX_TRACKERS) {
-		tracker_remote_command[tracker_id] = command_flag;
+	esb_send_remote_command_arg(tracker_id, command_flag, 0);
+}
 
-		/* Reset ARQ state when data collection starts */
+void esb_send_remote_command_arg(uint8_t tracker_id, uint8_t command_flag, uint8_t arg)
+{
+	if (tracker_id < MAX_TRACKERS) {
+		if (command_flag == ESB_PONG_FLAG_DATA_COLLECT_ON ||
+		    command_flag == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) {
+			last_raw_valid[tracker_id] = false;
+		}
 		if (command_flag == ESB_PONG_FLAG_DATA_COLLECT_ON) {
 			raw_arq_reset();
 		}
-
-		LOG_INF(
-			"Remote command %s (0x%02X) queued for tracker %d",
-			esb_pong_flag_name(command_flag),
-			command_flag,
-			tracker_id
-		);
+		pending_cmd_arg[tracker_id] = arg;
+		tracker_remote_command[tracker_id] = command_flag;
+		LOG_INF("Remote command %s (0x%02X) queued for tracker %d", esb_pong_flag_name(command_flag),
+			command_flag, tracker_id);
 	} else {
 		LOG_ERR("Invalid tracker ID: %d", tracker_id);
 	}

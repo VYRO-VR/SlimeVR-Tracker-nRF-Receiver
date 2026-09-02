@@ -97,6 +97,8 @@ static inline uint8_t esb_rf_channel_decode(uint8_t stored)
 #define ESB_PONG_FLAG_DFU_OTA 0x21          // Enter OTA DFU bootloader
 #define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
 #define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON 0x34  // Start batch raw data collection (data[8] = target Hz)
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF 0x35 // Stop batch raw data collection
 #define ESB_PONG_FLAG_SENS_AUTO 0x24        // Auto-calibrate gyro sensitivity
 #define ESB_PONG_FLAG_MAG_AUTO_ON 0x25      // Enable online magnetometer calibration
 #define ESB_PONG_FLAG_MAG_AUTO_OFF 0x26     // Disable online magnetometer calibration
@@ -154,6 +156,7 @@ uint32_t esb_get_stats_detailed_remaining(void);        // Get remaining time (0
 
 // Remote command API
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag);
+void esb_send_remote_command_arg(uint8_t tracker_id, uint8_t command_flag, uint8_t arg);
 /* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */
 uint32_t esb_send_remote_command_all(uint8_t command_flag);
 /* Targeted test commands: publish TPS, then queue the flag. Return the

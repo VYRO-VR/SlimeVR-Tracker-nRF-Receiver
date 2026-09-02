@@ -165,9 +165,11 @@ static void print_help(void)
 	printk(
 		"Other:\n"
 		"  collect <id>               Start raw sensor data collection from tracker\n"
+		"  collectall <rate_hz>       Start batch raw data collection from all paired trackers\n"
 		"  collect off                Stop data collection\n"
+		"  collectstop                Stop batch data collection\n"
 		"  collect                    Show data collection status\n"
-		"  ota                        Show ESB OTA update status\n"
+		"  ota                        Show OTA update status\n"
 		"  ota info <id>              Query firmware info from tracker\n"
 		"  ota abort                  Abort active OTA session\n"
 		"  meow                       Meow!\n"
@@ -269,6 +271,8 @@ static void console_thread(void)
 #endif
 
 	const char command_meow[] = "meow";
+	const char command_collectall[] = "collectall";
+	const char command_collectstop[] = "collectstop";
 	const char command_collect[] = "collect";
 	const char command_ota[] = "ota";
 
@@ -428,16 +432,42 @@ static void console_thread(void)
 			}
 		}
 #endif
-		else if (strcmp(argv[0], command_meow) == 0) {
+		else if (strcmp(argv[0], command_collectall) == 0) {
+#ifdef CONFIG_DATA_COLLECT
+			uint8_t rate;
+			if (!arg || !parse_u8_arg(arg, &rate)) {
+				printk("Invalid rate. Must be 0-255 Hz.\n");
+			} else if (rcv_cmd_collect_batch_start(rate) == RCV_HID_ST_OK) {
+				printk("Batch data collection started at %u Hz\n", rate);
+			}
+#else
+			printk("Data collection not available (build with CONFIG_DATA_COLLECT=y)\n");
+#endif
+		} else if (strcmp(argv[0], command_collectstop) == 0) {
+#ifdef CONFIG_DATA_COLLECT
+			rcv_cmd_collect_batch_stop();
+			printk("Batch data collection stopped\n");
+#else
+			printk("Data collection not available (build with CONFIG_DATA_COLLECT=y)\n");
+#endif
+		} else if (strcmp(argv[0], command_meow) == 0) {
 			print_meow();
 		} else if (strcmp(argv[0], command_collect) == 0) {
 #ifdef CONFIG_DATA_COLLECT
 			if (arg && strcmp(arg, "off") == 0) {
+				bool stopped_any = false;
+				if (data_collect_batch_is_active()) {
+					rcv_cmd_collect_batch_stop();
+					printk("Batch data collection stopped\n");
+					stopped_any = true;
+				}
 				if (data_collect_is_active()) {
 					uint8_t tid = data_collect_get_target_id();
 					rcv_cmd_collect_stop();
 					printk("Data collection stopped, sent OFF to tracker %u\n", tid);
-				} else {
+					stopped_any = true;
+				}
+				if (!stopped_any) {
 					printk("Data collection is not active\n");
 				}
 			} else if (arg) {
@@ -456,9 +486,18 @@ static void console_thread(void)
 			} else {
 				if (data_collect_is_active()) {
 					printk("Data collection ACTIVE for tracker %u\n", data_collect_get_target_id());
+				} else if (data_collect_batch_is_active()) {
+					uint32_t mask = 0;
+					for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+						if (data_collect_batch_is_target(i)) {
+							mask |= BIT(i);
+						}
+					}
+					printk("Batch data collection ACTIVE, tracker mask 0x%08x (use 'collectstop')\n",
+					       (unsigned int)mask);
 				} else {
 					printk("Data collection inactive\n");
-					printk("Usage: collect <tracker_id> | collect off\n");
+					printk("Usage: collect <tracker_id> | collect off | collectall <rate_hz>\n");
 				}
 			}
 #else
