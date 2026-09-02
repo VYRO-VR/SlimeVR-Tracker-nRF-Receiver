@@ -335,8 +335,232 @@ def find_data_hid(device_index=None):
     return dc_devices[idx]["path"], dc_devices[idx]
 
 
-def collect_hid(output_path, duration=None, device_index=None):
-    """Main HID-based data collection loop with reorder buffer for ARQ retransmits."""
+class _CollectorState:
+    """Independent metadata, calibration, output, and sequence state."""
+
+    REORDER_BUF_MAX = 200
+
+    def __init__(self, output_path, tracker_id=None):
+        self.tracker_id = tracker_id
+        self.meta = SensorMetadata()
+        self.cal = CalibrationData()
+        self.first_sample_time = None
+        self.frame_count = 0
+        self.sample_count = 0
+        self.last_rssi = 0
+        self.retransmit_count = 0
+        self.gap_count = 0
+        self.meta_written = False
+        self.raw_seen = False
+        self.reorder_buf = {}
+        self.write_cursor = None
+        self.csv_file = None
+        self.data_mode = "raw"
+
+        base = Path(output_path)
+        if tracker_id is not None:
+            stem = base.with_suffix("")
+            self.csv_path = stem.parent / f"{stem.name}.tracker-{tracker_id}.csv"
+            self.meta_path = stem.parent / f"{stem.name}.tracker-{tracker_id}.meta.txt"
+        else:
+            self.csv_path = base.with_suffix(".csv")
+            self.meta_path = base.with_suffix(".meta.txt")
+
+    @property
+    def label(self):
+        return f"tracker {self.tracker_id}" if self.tracker_id is not None else "legacy"
+
+    def _open_csv(self, data_mode):
+        if self.csv_file is not None:
+            self.csv_file.close()
+        self.data_mode = data_mode
+        self.csv_file = open(self.csv_path, "w", encoding="utf-8")
+        if data_mode == "gyr_quat":
+            self.csv_file.write("seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp\n")
+        else:
+            self.csv_file.write("seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp\n")
+
+    def ensure_csv(self, pkt_type):
+        if self.csv_file is None:
+            self._open_csv("gyr_quat" if pkt_type == 0x13 else "raw")
+        elif pkt_type == 0x13 and self.data_mode == "raw":
+            # Preserve the legacy collector's mode transition semantics: a
+            # gyrQuat stream gets the data2-compatible header.
+            self._open_csv("gyr_quat")
+            if self.meta_written:
+                # Metadata is append-only after first raw data; rewrite its
+                # mode line so delayed gyrQuat packets remain self-describing.
+                lines = self.meta_path.read_text(encoding="utf-8").splitlines()
+                with open(self.meta_path, "w", encoding="utf-8") as f:
+                    for line in lines:
+                        f.write("data_mode=gyr_quat\n" if line.startswith("data_mode=") else line + "\n")
+
+    def write_metadata(self):
+        with open(self.meta_path, "w", encoding="utf-8") as f:
+            f.write(f"gyro_range_dps={self.meta.gyro_range}\n")
+            f.write(f"accel_range_g={self.meta.accel_range}\n")
+            f.write(f"gyro_odr_hz={self.meta.gyro_odr}\n")
+            if self.meta.gyro_chip_odr is not None:
+                f.write(f"gyro_chip_odr_hz={self.meta.gyro_chip_odr}\n")
+            if self.meta.gyro_fusion_odr is not None:
+                f.write(f"gyro_fusion_odr_hz={self.meta.gyro_fusion_odr}\n")
+            f.write(f"accel_odr_hz={self.meta.accel_odr}\n")
+            f.write(f"mag_odr_hz={self.meta.mag_odr}\n")
+            f.write(f"imu_id={self.meta.imu_id}\n")
+            f.write(f"mag_id={self.meta.mag_id}\n")
+            f.write("temp_source=tcal_float_c\n")
+            f.write(f"data_mode={self.data_mode}\n")
+            if self.cal.has_data:
+                self.cal.write_to_file(f)
+        self.meta_written = True
+
+    def parse_metadata(self, payload):
+        self.meta.parse(payload)
+        print(f"\nMetadata received ({self.label}): {self.meta}")
+
+    def parse_calibration(self, payload):
+        self.cal.parse(payload)
+        print(
+            f"  {self.label}: Cal sub={payload[2]} "
+            f"accel={self.cal.accel_BAinv is not None} "
+            f"mag={self.cal.mag_BAinv is not None} "
+            f"gyro={self.cal.gyro_bias is not None}"
+        )
+
+    def _flush_reorder_buf(self):
+        if self.write_cursor is None:
+            return
+        while self.write_cursor in self.reorder_buf:
+            self.csv_file.write(self.reorder_buf.pop(self.write_cursor))
+            self.sample_count += 1
+            self.write_cursor = (self.write_cursor + 1) & 0xFFFF
+
+    def _force_flush_reorder_buf(self):
+        if not self.reorder_buf:
+            return
+        sorted_seqs = sorted(
+            self.reorder_buf,
+            key=lambda seq: (seq - self.write_cursor) & 0xFFFF,
+        )
+        for seq in sorted_seqs:
+            gap = (seq - self.write_cursor) & 0xFFFF
+            if gap > 0:
+                self.gap_count += gap
+                self.write_cursor = seq
+            self.csv_file.write(self.reorder_buf[seq])
+            self.sample_count += 1
+            self.write_cursor = (self.write_cursor + 1) & 0xFFFF
+        self.reorder_buf.clear()
+
+    def accept_raw(self, payload, pkt_type, now):
+        sample = parse_raw_imu_quat(payload) if pkt_type == 0x13 else parse_raw_imu(payload)
+        if not sample:
+            return False
+
+        seq = sample["seq"]
+        if self.tracker_id is not None:
+            # Batch mode: no dup, no ARQ — per-tracker packets arrive in seq
+            # order and gaps are permanent. Write on arrival, count gaps now.
+            self.ensure_csv(pkt_type)
+            if self.meta.received and not self.meta_written:
+                self.write_metadata()
+            if self.write_cursor is None:
+                self.write_cursor = seq
+                self.first_sample_time = now
+                self.raw_seen = True
+            else:
+                diff = (seq - self.write_cursor) & 0xFFFF
+                if diff > 0x8000:
+                    self.retransmit_count += 1
+                    return False  # stale duplicate of already-written data
+                if diff > 0:
+                    self.gap_count += diff  # seqs [cursor, seq) never arrive
+            self.csv_file.write(self._csv_line(sample, seq))
+            self.sample_count += 1
+            self.write_cursor = (seq + 1) & 0xFFFF
+            return True
+
+        if self.write_cursor is not None:
+            diff = (seq - self.write_cursor) & 0xFFFF
+            if diff > 0x8000:
+                self.retransmit_count += 1
+                return False
+        if seq in self.reorder_buf:
+            return False
+
+        self.ensure_csv(pkt_type)
+        if self.meta.received and not self.meta_written:
+            self.write_metadata()
+
+        if self.write_cursor is None:
+            self.write_cursor = seq
+            self.first_sample_time = now
+            self.raw_seen = True
+
+        self.reorder_buf[seq] = self._csv_line(sample, seq)
+        diff = (seq - self.write_cursor) & 0xFFFF
+        if 0 < diff < self.REORDER_BUF_MAX:
+            has_later = any(
+                0 < ((other - seq) & 0xFFFF) < self.REORDER_BUF_MAX
+                for other in self.reorder_buf if other != seq
+            )
+            if has_later:
+                self.retransmit_count += 1
+
+        self._flush_reorder_buf()
+        if len(self.reorder_buf) >= self.REORDER_BUF_MAX:
+            self._force_flush_reorder_buf()
+        return True
+
+    def _csv_line(self, sample, seq):
+        mag = sample.get("mag") or (0.0, 0.0, 0.0)
+        temp = sample.get("temp_c") or 0.0
+        if self.data_mode == "gyr_quat":
+            q = sample["gyr_quat"]
+            return (
+                f"{seq},"
+                f"{q[0]:.9f},{q[1]:.9f},{q[2]:.9f},{q[3]:.9f},"
+                f"{sample['accel'][0]:.6f},{sample['accel'][1]:.6f},{sample['accel'][2]:.6f},"
+                f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
+                f"{temp:.6f}\n"
+            )
+        return (
+            f"{seq},"
+            f"{sample['gyro'][0]:.6f},{sample['gyro'][1]:.6f},{sample['gyro'][2]:.6f},"
+            f"{sample['accel'][0]:.6f},{sample['accel'][1]:.6f},{sample['accel'][2]:.6f},"
+            f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
+            f"{temp:.6f}\n"
+        )
+
+    def flush(self):
+        if self.reorder_buf and self.write_cursor is not None:
+            self._force_flush_reorder_buf()
+        if self.csv_file is not None:
+            self.csv_file.flush()
+
+    def finalize(self, end_time):
+        self.flush()
+        if self.csv_file is not None:
+            self.csv_file.close()
+            self.csv_file = None
+        if not self.raw_seen:
+            return 0.0
+        data_duration = end_time - self.first_sample_time if self.first_sample_time else 0.0
+        if not self.meta_written and self.meta.received:
+            self.write_metadata()
+        if self.meta_written:
+            with open(self.meta_path, "a", encoding="utf-8") as f:
+                if self.cal.has_data:
+                    f.write("\n# Final calibration (complete)\n")
+                    self.cal.write_to_file(f)
+                f.write("\n# Collection summary\n")
+                f.write(f"duration_s={data_duration:.3f}\n")
+                f.write(f"sample_count={self.sample_count}\n")
+                f.write(f"gap_count={self.gap_count}\n")
+        return data_duration
+
+def collect_hid(output_path, duration=None, device_index=None, batch=False):
+    """Collect HID raw packets, optionally maintaining one state per tracker."""
     import hid
 
     dev_path, dev_info = find_data_hid(device_index)
@@ -351,82 +575,48 @@ def collect_hid(output_path, duration=None, device_index=None):
 
     h = hid.device()
     h.open_path(dev_path)
-
-    meta = SensorMetadata()
-    cal = CalibrationData()
     start_time = time.time()
-    first_sample_time = None  # set when first data sample arrives
+    first_sample_time = None
     frame_count = 0
-    sample_count = 0
     last_status = start_time
     last_status_samples = 0
-    last_rssi = 0
-    retransmit_count = 0  # packets that filled a gap in the reorder buffer
-    gap_count = 0  # sequence gaps that were never filled (actual loss)
-    meta_written = False  # metadata file written once on first IMU data
+    status_ticks = 0
+    last_status_arrivals = 0
+    states = {}
+    legacy_state = None if batch else _CollectorState(output_path)
 
-    # Reorder buffer: holds samples until we can write them in order.
-    # Keyed by sequence number; flushed when contiguous run available.
-    REORDER_BUF_MAX = 200  # match receiver raw ARQ stale window before force-flush
-    reorder_buf = {}  # seq -> csv_line
-    write_cursor = None  # next seq expected to be written
-
-    base = Path(output_path)
-    meta_path = base.with_suffix(".meta.txt")
-    csv_path = base.with_suffix(".csv")
-
-    print(f"Collecting data via HID...")
-    print(f"Output: {csv_path}")
+    print("Collecting data via HID...")
+    if batch:
+        print(f"Output: {Path(output_path)}.tracker-<id>.csv")
+    else:
+        print(f"Output: {legacy_state.csv_path}")
     if duration:
         print(f"Duration: {duration}s")
     print("Press Ctrl+C to stop\n")
+    if not batch:
+        # Legacy mode creates its output immediately, matching prior behavior.
+        legacy_state._open_csv("raw")
 
-    csv_file = open(csv_path, "w", encoding="utf-8")
-    csv_file.write("seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp\n")
-    data_mode = "raw"  # switches to "gyr_quat" when gyrQuat packets arrive
 
-    def flush_reorder_buf():
-        """Write contiguous samples from write_cursor onwards."""
-        nonlocal write_cursor, sample_count
-        if write_cursor is None:
-            return
-        while write_cursor in reorder_buf:
-            csv_file.write(reorder_buf.pop(write_cursor))
-            sample_count += 1
-            write_cursor = (write_cursor + 1) & 0xFFFF
-
-    def force_flush_reorder_buf():
-        """Force-flush oldest samples when buffer is too large."""
-        nonlocal write_cursor, sample_count, gap_count
-        if not reorder_buf:
-            return
-        # Sort remaining keys and write them all, counting gaps
-        sorted_seqs = sorted(reorder_buf.keys(),
-                             key=lambda s: (s - write_cursor) & 0xFFFF)
-        for seq in sorted_seqs:
-            # Count gaps between write_cursor and this seq
-            gap = (seq - write_cursor) & 0xFFFF
-            if gap > 0:
-                gap_count += gap
-                write_cursor = seq
-            csv_file.write(reorder_buf[seq])
-            sample_count += 1
-            write_cursor = (write_cursor + 1) & 0xFFFF
-        reorder_buf.clear()
+    def get_state(tracker_id):
+        if not batch:
+            return legacy_state
+        state = states.get(tracker_id)
+        if state is None:
+            state = _CollectorState(output_path, tracker_id)
+            states[tracker_id] = state
+        return state
 
     try:
         while True:
             report = h.read(64, timeout_ms=500)
             if not report:
                 continue
-
             report = bytes(report)
             if len(report) < 2:
                 continue
 
             pkt_type = report[0]
-            frame_count += 1
-
             if pkt_type == 0x10:
                 esb_len = 48
             elif pkt_type == 0x13:
@@ -434,174 +624,100 @@ def collect_hid(output_path, duration=None, device_index=None):
             elif pkt_type == 0x11:
                 esb_len = 16
             elif pkt_type == 0x12:
-                esb_len = 52  # meta with chip/fusion trailer
+                esb_len = 52
             elif pkt_type == 0x14:
                 esb_len = 52
             else:
                 continue
+            if len(report) < esb_len or esb_len < 2:
+                continue
 
             esb_payload = report[:esb_len]
+            tracker_id = esb_payload[1]
+            if batch and not 0 <= tracker_id <= 15:
+                continue
+            state = get_state(tracker_id)
+            state.frame_count += 1
+            frame_count += 1
             if len(report) > esb_len:
-                last_rssi = report[esb_len]
+                state.last_rssi = report[esb_len]
 
-            if pkt_type == 0x12:  # Metadata
-                meta.parse(esb_payload)
-                print(f"\nMetadata received: {meta}")
-
-            elif pkt_type == 0x14:  # Calibration data
-                cal.parse(esb_payload)
-                print(f"  Cal sub={esb_payload[2]} accel={cal.accel_BAinv is not None} mag={cal.mag_BAinv is not None} gyro={cal.gyro_bias is not None}")
-
-            elif pkt_type == 0x10 or pkt_type == 0x13:  # Raw IMU or gyrQuat
-                # Detect mode on first packet
-                if pkt_type == 0x13 and data_mode == "raw":
-                    data_mode = "gyr_quat"
-                    csv_file.close()
-                    csv_file = open(csv_path, "w", encoding="utf-8")
-                    csv_file.write("seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp\n")
-
-                # Write metadata file once on first IMU data arrival
-                if meta.received and not meta_written:
-                    meta_written = True
-                    with open(meta_path, "w", encoding="utf-8") as f:
-                        f.write(f"gyro_range_dps={meta.gyro_range}\n")
-                        f.write(f"accel_range_g={meta.accel_range}\n")
-                        f.write(f"gyro_odr_hz={meta.gyro_odr}\n")
-                        if meta.gyro_chip_odr is not None:
-                            f.write(f"gyro_chip_odr_hz={meta.gyro_chip_odr}\n")
-                        if meta.gyro_fusion_odr is not None:
-                            f.write(f"gyro_fusion_odr_hz={meta.gyro_fusion_odr}\n")
-                        f.write(f"accel_odr_hz={meta.accel_odr}\n")
-                        f.write(f"mag_odr_hz={meta.mag_odr}\n")
-                        f.write(f"imu_id={meta.imu_id}\n")
-                        f.write(f"mag_id={meta.mag_id}\n")
-                        f.write("temp_source=tcal_float_c\n")
-                        f.write(f"data_mode={data_mode}\n")
-                        if cal.has_data:
-                            cal.write_to_file(f)
-                    print(f"  Metadata + calibration written to {meta_path}")
-
-                if pkt_type == 0x13:
-                    s = parse_raw_imu_quat(esb_payload)
-                else:
-                    s = parse_raw_imu(esb_payload)
-
-                if s:
-                    seq = s["seq"]
-
-                    # Detect retransmit (seq < write_cursor or already in buffer)
-                    if write_cursor is not None:
-                        diff = (seq - write_cursor) & 0xFFFF
-                        if diff > 0x8000:
-                            # seq is behind write_cursor — late retransmit, already written
-                            retransmit_count += 1
-                            continue
-                    if seq in reorder_buf:
-                        # Duplicate
-                        continue
-
-                    # Initialize write cursor on first sample
-                    if write_cursor is None:
-                        write_cursor = seq
-                        first_sample_time = time.time()
-
-                    mag = s.get("mag") or (0.0, 0.0, 0.0)
-                    temp = s.get("temp_c") or 0.0
-
-                    if data_mode == "gyr_quat":
-                        q = s["gyr_quat"]
-                        csv_line = (
-                            f"{seq},"
-                            f"{q[0]:.9f},{q[1]:.9f},{q[2]:.9f},{q[3]:.9f},"
-                            f"{s['accel'][0]:.6f},{s['accel'][1]:.6f},{s['accel'][2]:.6f},"
-                            f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
-                            f"{temp:.6f}\n"
-                        )
-                    else:
-                        csv_line = (
-                            f"{seq},"
-                            f"{s['gyro'][0]:.6f},{s['gyro'][1]:.6f},{s['gyro'][2]:.6f},"
-                            f"{s['accel'][0]:.6f},{s['accel'][1]:.6f},{s['accel'][2]:.6f},"
-                            f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
-                            f"{temp:.6f}\n"
-                        )
-
-                    reorder_buf[seq] = csv_line
-
-                    # Detect retransmit: a packet that fills a gap
-                    # (write_cursor < seq, but seq is behind some already-buffered seqs)
-                    diff = (seq - write_cursor) & 0xFFFF
-                    if diff > 0 and diff < REORDER_BUF_MAX:
-                        # Check if there are buffered seqs ahead of this one
-                        # (meaning this seq was missing and just got retransmitted)
-                        has_later = any(
-                            0 < ((s2 - seq) & 0xFFFF) < REORDER_BUF_MAX
-                            for s2 in reorder_buf if s2 != seq
-                        )
-                        if has_later:
-                            retransmit_count += 1
-
-                    # Flush contiguous samples from write cursor
-                    flush_reorder_buf()
-
-                    # Force flush if buffer is too large (gap not filled in time)
-                    if len(reorder_buf) >= REORDER_BUF_MAX:
-                        force_flush_reorder_buf()
+            if pkt_type == 0x12:
+                state.parse_metadata(esb_payload)
+            elif pkt_type == 0x14:
+                state.parse_calibration(esb_payload)
+            elif pkt_type == 0x10 or pkt_type == 0x13:
+                now = time.time()
+                accepted = state.accept_raw(esb_payload, pkt_type, now)
+                if accepted and first_sample_time is None:
+                    first_sample_time = now
 
             now = time.time()
             if now - last_status >= 2.0:
-                csv_file.flush()
-                elapsed = now - (first_sample_time or start_time)
+                current_states = states.values() if batch else (legacy_state,)
+                for current in current_states:
+                    current.flush()
+                all_states = list(states.values()) if batch else [legacy_state]
+                status_ticks += 1
+                arrivals = sum(s.sample_count + len(s.reorder_buf) for s in all_states)
+                aggregate_samples = sum(s.sample_count for s in all_states)
+                aggregate_gaps = sum(s.gap_count for s in all_states)
                 period = now - last_status
-                period_samples = sample_count - last_status_samples
-                rate = period_samples / period if period > 0 else 0
-                buffered = len(reorder_buf)
-                retx_info = f", Retx: {retransmit_count}" if retransmit_count > 0 else ""
-                buf_info = f", Buf: {buffered}" if buffered > 0 else ""
-                # Loss = gaps that were never filled
-                total = sample_count + gap_count
-                loss_pct = gap_count / total * 100 if total > 0 else 0
-                loss_info = f", Loss: {gap_count} ({loss_pct:.1f}%)" if gap_count > 0 else ""
+                rate = ((arrivals - last_status_arrivals) / period
+                        if period > 0 else 0)
+                buffered = sum(len(s.reorder_buf) for s in all_states)
+                total = aggregate_samples + aggregate_gaps
+                loss_pct = aggregate_gaps / total * 100 if total > 0 else 0
                 print(
-                    f"\r[{elapsed:.1f}s] Samples: {sample_count} ({rate:.0f}/s)"
-                    f"{retx_info}{buf_info}{loss_info}, RSSI: {last_rssi}   ",
-                    end="",
-                    flush=True,
+                    f"\r[{now - (first_sample_time or start_time):.1f}s] "
+                    f"in:{rate:.0f}/s ok:{aggregate_samples} "
+                    f"loss:{aggregate_gaps} ({loss_pct:.1f}%) buf:{buffered} "
+                    f"trackers:{len(all_states)}   ",
+                    end="", flush=True,
                 )
+                if batch and status_ticks % 5 == 0:
+                    detail = "  ".join(
+                        f"t{item.tracker_id}:"
+                        f"{(item.sample_count + len(item.reorder_buf) - item.last_status_samples) / period:.0f}/s"
+                        f" ok={item.sample_count} loss={item.gap_count}"
+                        for item in all_states
+                    )
+                    print(f"\n  {detail}", flush=True)
                 last_status = now
-                last_status_samples = sample_count
+                last_status_arrivals = arrivals
+                for item in all_states:
+                    item.last_status_samples = item.sample_count + len(item.reorder_buf)
 
-            if duration and first_sample_time and (now - first_sample_time >= duration):
+            if duration and first_sample_time and now - first_sample_time >= duration:
                 break
 
     except KeyboardInterrupt:
         print("\n\nStopping collection...")
     finally:
-        # Flush remaining buffer
-        if reorder_buf:
-            force_flush_reorder_buf()
-        csv_file.close()
-        h.close()
+        try:
+            h.close()
+        finally:
+            end_time = time.time()
+            all_states = list(states.values()) if batch else [legacy_state]
+            for state in all_states:
+                state.finalize(end_time)
 
-    data_duration = (time.time() - first_sample_time) if first_sample_time else 0
-    print(f"\n\nCollection complete:")
+    data_duration = time.time() - first_sample_time if first_sample_time else 0
+    aggregate_samples = sum(s.sample_count for s in all_states)
+    aggregate_retx = sum(s.retransmit_count for s in all_states)
+    aggregate_gaps = sum(s.gap_count for s in all_states)
+    total = aggregate_samples + aggregate_gaps
+    loss_pct = aggregate_gaps / total * 100 if total > 0 else 0
+    print("\n\nCollection complete:")
     print(f"  Duration: {data_duration:.1f}s")
-    print(f"  Samples: {sample_count} -> {csv_path}")
-    print(f"  Retransmits received: {retransmit_count}")
-    total = sample_count + gap_count
-    loss_pct = gap_count / total * 100 if total > 0 else 0
-    print(f"  Gaps (lost): {gap_count} ({loss_pct:.2f}%)")
-    if meta_written:
-        with open(meta_path, "a", encoding="utf-8") as f:
-            # Final calibration write — ensures all late-arriving cal data is saved
-            if cal.has_data:
-                f.write(f"\n# Final calibration (complete)\n")
-                cal.write_to_file(f)
-            f.write(f"\n# Collection summary\n")
-            f.write(f"duration_s={data_duration:.3f}\n")
-            f.write(f"sample_count={sample_count}\n")
-            f.write(f"gap_count={gap_count}\n")
-        print(f"  Metadata: {meta_path}")
+    print(f"  Samples: {aggregate_samples}")
+    print(f"  Retransmits received: {aggregate_retx}")
+    print(f"  Gaps (lost): {aggregate_gaps} ({loss_pct:.2f}%)")
+    for state in all_states:
+        if state.raw_seen:
+            print(f"  {state.label}: {state.sample_count} samples -> {state.csv_path}")
+            if state.meta_written:
+                print(f"  {state.label} metadata: {state.meta_path}")
 
 
 def main():
@@ -620,6 +736,10 @@ def main():
         "--device", type=int, default=None,
         help="Device index when multiple receivers are connected (0-based)",
     )
+    parser.add_argument(
+        "--batch", action="store_true",
+        help="Write independent output files for each tracker ID (0-15)",
+    )
     args = parser.parse_args()
 
     try:
@@ -628,7 +748,8 @@ def main():
         print("Error: hidapi is required. Install with: pip install hidapi")
         sys.exit(1)
 
-    collect_hid(args.output, args.duration, args.device)
+    collect_hid(args.output, args.duration, args.device, args.batch)
+
 
 
 if __name__ == "__main__":
