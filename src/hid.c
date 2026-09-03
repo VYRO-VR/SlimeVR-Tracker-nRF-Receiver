@@ -695,7 +695,7 @@ SYS_INIT(composite_pre_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
 //|RX     3|status ("status")
 //|RX     4|full precision quat and magnetometer
 //|RX     5|runtime ("status2")
-//|RX     6|reduced precision quat and accel with button and sleep time ("info2")
+//|RX     6|gyro sensitivity calibration progress/result (sens auto)
 //|RX     7|button and sleep time ("info2")
 
 //|b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11     |b12     |b13     |b14     |b15     |
@@ -706,10 +706,29 @@ SYS_INIT(composite_pre_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
 //|RX     3|id      |svr_stat|status  |resv----------------------------------------------------------------------------------------------|rssi    |
 //|RX     4|id      |q0               |q1               |q2               |q3               |m0               |m1               |m2               |
 //|RX     5|id      |runtime                                                                |resv----------------------------------------|rssi    |
-//|RX     6|id      |button  |sleeptime        |resv-------------------------------------------------------------------------------------|rssi    |
+//|RX     6|id      |phase   |result  |axis    |seq     |scale_q12        |progress         |resv------------------------------|rssi    |
 //|RX     7|id      |button  |sleeptime        |q_buf                              |a0               |a1               |a2               |rssi    |
 
 // runtime is in microseconds (overkill), sleeptime is in milliseconds (overkill but less)
+
+// Type 6 is the gyro sensitivity calibration report. It replaces the legacy
+// "reduced precision quat + button/sleeptime" meaning of type 6, which this
+// tracker firmware does not send. Sent standalone only, never inside a
+// composite (0xFE) frame: an unknown sub-type inside a composite cannot be
+// skipped and would mis-offset every sub-packet after it.
+//   phase     enum sens_cal_phase: 0 idle, 1 hold still, 2 bias, 3 armed,
+//             4 recording, 5 done (terminal, see result)
+//   result    enum sens_cal_result: 0 none (still running), 1 ok, 2 invalid
+//             params, 3 not still, 4 gyro timeout, 5 no bias samples, 6 no
+//             spin, 7 spin timeout, 8 angle too small, 9 invalid scale,
+//             10 off axis, 11 scale range, 12 no retained
+//   axis      0 = X, 1 = Y, 2 = Z
+//   seq       incremented once per completed run
+//   scale_q12 little-endian uint16, scale = scale_q12 / 4096.0, 0 = n/a
+//   progress  little-endian uint16, integrated absolute rotation in whole
+//             degrees, saturating; divide by 360 for a turn counter
+// Cadence is 2 Hz while a run is in progress plus a 10 s linger after a
+// terminal result. b15 carries RSSI like every other tracker stream type.
 
 /* byte[1] is a tracker id for stream/registration types, not for cmd/ACK. */
 static bool hid_type_byte1_is_tracker_id(uint8_t type)
