@@ -59,6 +59,11 @@
 #define OTA_BEGIN_PACKET_SIZE   64
 #define OTA_FW_INFO_PACKET_SIZE 66
 
+#define OTA_BOOTLOADER_NONE          0
+#define OTA_BOOTLOADER_ADAFRUIT_UF2  1
+#define OTA_BOOTLOADER_NRF5_OPENDFU  2
+#define OTA_BOOTLOADER_MCUBOOT       3
+
 /* HID OTA report types (PC ↔ Receiver) */
 #define HID_OTA_QUERY_INFO      0xF0
 #define HID_OTA_FW_INFO         0xF1

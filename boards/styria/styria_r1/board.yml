@@ -3,6 +3,7 @@
 
 board:
   name: styria_r1_uf2
+  full_name: Styria R1
   vendor: styria
   socs:
     - name: nrf52840

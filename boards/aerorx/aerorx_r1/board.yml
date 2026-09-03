@@ -3,6 +3,7 @@
 
 board:
   name: aerorx_r1_uf2
+  full_name: AeroRX R1
   vendor: aerorx
   socs:
     - name: nrf52840

@@ -3,6 +3,7 @@
 
 board:
   name: foxdongle_uf2
+  full_name: FoxApplication Receiver FoxDongle
   vendor: foxapplication
   socs:
     - name: nrf52840

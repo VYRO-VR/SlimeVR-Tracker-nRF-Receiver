@@ -167,7 +167,7 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		cmd_name = "Fusion reset";
 	} else if (strcmp(arg2, "channel") == 0) {
 		if (!arg3) {
-			printk("Usage: send all channel <1-100>\n");
+			printk("Usage: send all channel <0-100>\n");
 			printk("Example: send all channel 25 - Set all active trackers to channel 25\n");
 			return;
 		}
@@ -175,8 +175,8 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		char *endptr;
 		long channel = strtol(arg3, &endptr, 10);
 
-		if (*endptr != '\0' || channel < 1 || channel > 100) {
-			printk("Invalid channel. Must be a number between 1 and 100.\n");
+		if (*endptr != '\0' || channel < 0 || channel > 100) {
+			printk("Invalid channel. Must be a number between 0 and 100.\n");
 			return;
 		}
 
@@ -449,18 +449,63 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		return;
 	} else if (strcmp(arg2, "test") == 0) {
 		if (!arg3) {
-			printk("Usage: send <id|all> test <on|off>\n");
-			printk("Example: send 0 test on       - Enable test mode on tracker 0\n");
-			printk("Example: send all test on     - Enable test mode on all active trackers\n");
+			printk("Usage: send <id|all> test <on|off> [tps]\n");
+			printk("Example: send 0 test on       - Enable test mode on tracker 0 (default rate)\n");
+			printk("Example: send all test on 200 - Enable test mode, target 200 TPS\n");
+			printk("  TPS is clamped to the tracker's TDMA slot capacity; 0 = built-in default.\n");
 			return;
 		}
 
 		if (strcmp(arg3, "on") == 0) {
-			console_send_flag(target_all, tracker_id, ESB_PONG_FLAG_TEST_MODE_ON, "Test mode enable");
+			/* One test-specific command carries the optional TPS (0 =
+			 * built-in default) and the ON flag, so the rate is published
+			 * before the tracker sees the flag. */
+			uint16_t tps = 0;
+			if (arg4 && *arg4) {
+				char *endptr;
+				long v = strtol(arg4, &endptr, 10);
+				if (*endptr != '\0' || v < 0 || v > 1000) {
+					printk("Invalid TPS. Must be 0-1000 (0 = default).\n");
+					return;
+				}
+				tps = (uint16_t)v;
+			}
+			uint8_t st = rcv_cmd_remote_test_on(target_all ? RCV_HID_TARGET_ALL : tracker_id, tps);
+			if (st == RCV_HID_ST_OK || st == RCV_HID_ST_STARTED) {
+				if (target_all) {
+					printk(
+						"Test mode enable sent to all active trackers (target %u TPS%s)\n",
+						tps,
+						tps == 0 ? ", built-in default" : ""
+					);
+				} else {
+					printk(
+						"Test mode enable sent to tracker %d (target %u TPS%s)\n",
+						tracker_id,
+						tps,
+						tps == 0 ? ", built-in default" : ""
+					);
+				}
+			} else if (st == RCV_HID_ST_ENOENT) {
+				printk("Test mode enable failed: no active trackers\n");
+			} else {
+				printk("Test mode enable failed: status %u\n", st);
+			}
 		} else if (strcmp(arg3, "off") == 0) {
-			console_send_flag(target_all, tracker_id, ESB_PONG_FLAG_TEST_MODE_OFF, "Test mode disable");
+			uint8_t st = rcv_cmd_remote_test_off(target_all ? RCV_HID_TARGET_ALL : tracker_id);
+			if (st == RCV_HID_ST_OK || st == RCV_HID_ST_STARTED) {
+				if (target_all) {
+					printk("Test mode disable sent to all active trackers\n");
+				} else {
+					printk("Test mode disable sent to tracker %d\n", tracker_id);
+				}
+			} else if (st == RCV_HID_ST_ENOENT) {
+				printk("Test mode disable failed: no active trackers\n");
+			} else {
+				printk("Test mode disable failed: status %u\n", st);
+			}
 		} else {
-			printk("Unknown test subcommand: %s (use 'on' or 'off')\n", arg3);
+			printk("Unknown test subcommand: %s (use 'on [tps]' or 'off')\n", arg3);
 		}
 		return;
 	}

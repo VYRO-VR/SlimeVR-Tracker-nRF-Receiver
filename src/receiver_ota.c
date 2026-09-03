@@ -18,7 +18,15 @@
 #include <zephyr/drivers/flash.h>
 #include <zephyr/sys/crc.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/logging/log.h>
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && DT_NODE_EXISTS(DT_NODELABEL(slot1_partition))
+#include <zephyr/dfu/mcuboot.h>
+#include <zephyr/storage/flash_map.h>
+#define RCV_OTA_USE_MCUBOOT 1
+#else
+#define RCV_OTA_USE_MCUBOOT 0
+#endif
 #include <hal/nrf_nvmc.h>
 #include <string.h>
 
@@ -36,9 +44,12 @@ LOG_MODULE_REGISTER(receiver_ota, LOG_LEVEL_INF);
 
 /*
  * App partition end address (before NVS storage).
- * These match the partition manager layouts.
+ * These match the fixed-partition layouts.
  */
-#if CONFIG_SOC_NRF52840
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+#define RCV_OTA_FLASH_END        0
+#define RCV_OTA_BOOTLOADER_SETTINGS_ADDR  0
+#elif CONFIG_SOC_NRF52840
 #define RCV_OTA_FLASH_END        0xDA000  /* holyiot: 0x1000-0xDA000 (868KB) */
 #define RCV_OTA_BOOTLOADER_SETTINGS_ADDR  0xFF000
 #elif CONFIG_SOC_NRF52833
@@ -49,7 +60,11 @@ LOG_MODULE_REGISTER(receiver_ota, LOG_LEVEL_INF);
 #endif
 
 /* Max image size: half of app region (staging needs the other half) */
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+#define RCV_OTA_MAX_IMAGE_SIZE   0
+#else
 #define RCV_OTA_MAX_IMAGE_SIZE   ((RCV_OTA_FLASH_END - RCV_OTA_FLASH_BASE) / 2)
+#endif
 
 /* Board target string */
 #ifndef CONFIG_BOARD_TARGET
@@ -267,12 +282,14 @@ static void rcv_ota_send_fw_info(void)
 	sys_put_le32((uint32_t)_flash_used, &info[9]);
 
 	/* Bootloader type */
-#if CONFIG_BUILD_OUTPUT_UF2
-	info[13] = 1; /* Adafruit UF2 */
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+	info[13] = OTA_BOOTLOADER_MCUBOOT;
+#elif CONFIG_BUILD_OUTPUT_UF2
+	info[13] = OTA_BOOTLOADER_ADAFRUIT_UF2;
 #elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-	info[13] = 2; /* nRF5 bootloader */
+	info[13] = OTA_BOOTLOADER_NRF5_OPENDFU;
 #else
-	info[13] = 0; /* None */
+	info[13] = OTA_BOOTLOADER_NONE;
 #endif
 
 	info[14] = OTA_PROTOCOL_VERSION;
@@ -281,7 +298,8 @@ static void rcv_ota_send_fw_info(void)
 	strncpy((char *)&info[15], RCV_BOARD_TARGET_STRING, OTA_BOARD_TARGET_MAX - 1);
 
 	/* Flash base address */
-	sys_put_be16((uint16_t)(RCV_OTA_FLASH_BASE >> 12), &info[63]);
+	sys_put_be16((uint16_t)((RCV_OTA_USE_MCUBOOT ? 0 : RCV_OTA_FLASH_BASE) >> 12),
+		     &info[63]);
 
 	info[65] = rcv_ota_crc8(info, 65);
 
@@ -342,9 +360,17 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 
 	/* nRF5 OpenDFU bootloader sets ACL write-protection on the app region,
 	 * preventing in-place flash copy.  Reject receiver self-OTA early. */
-#if CONFIG_BOARD_HAS_NRF5_BOOTLOADER && !CONFIG_BUILD_OUTPUT_UF2
+#if CONFIG_BOARD_HAS_NRF5_BOOTLOADER && !CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT
 	LOG_ERR("RCV OTA: self-update blocked — nRF5 OpenDFU bootloader ACL "
 		"write-protects app region. Use DFU/SWD to update this receiver.");
+	rcv_ota.state = RCV_OTA_ERROR;
+	rcv_ota.error_code = OTA_STATUS_ERROR;
+	rcv_ota_send_status();
+	return;
+#endif
+
+#if defined(CONFIG_BOOTLOADER_MCUBOOT) && !RCV_OTA_USE_MCUBOOT
+	LOG_ERR("RCV OTA: MCUboot self-update requires a secondary slot");
 	rcv_ota.state = RCV_OTA_ERROR;
 	rcv_ota.error_code = OTA_STATUS_ERROR;
 	rcv_ota_send_status();
@@ -364,7 +390,9 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 	uint32_t image_crc32 = sys_get_le32(&data[6]);
 	uint16_t total_packets = sys_get_be16(&data[10]);
 	uint8_t protocol_ver = data[12];
-	const char *board_target = (const char *)&data[13];
+	char board_target[OTA_BOARD_TARGET_MAX];
+	memcpy(board_target, &data[13], OTA_BOARD_TARGET_MAX - 1);
+	board_target[OTA_BOARD_TARGET_MAX - 1] = '\0';
 	uint32_t flash_base = (uint32_t)sys_get_be16(&data[61]) << 12;
 
 	LOG_INF("RCV OTA BEGIN: size=%u, crc32=0x%08X, packets=%u, proto=%u, board=%s, base=0x%X",
@@ -380,6 +408,35 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 	}
 
 	/* Validate image size */
+#if RCV_OTA_USE_MCUBOOT
+	if (!boot_is_img_confirmed()) {
+		LOG_ERR("RCV OTA: current MCUboot test image is not confirmed");
+		rcv_ota.state = RCV_OTA_ERROR;
+		rcv_ota.error_code = OTA_STATUS_ERROR;
+		rcv_ota_send_status();
+		return;
+	}
+	const struct flash_area *secondary;
+	int area_err = flash_area_open(FIXED_PARTITION_ID(slot1_partition), &secondary);
+	size_t image_offset = area_err ? 0 :
+		boot_get_image_start_offset(FIXED_PARTITION_ID(slot1_partition));
+	ssize_t trailer_offset = area_err ? area_err :
+		boot_get_area_trailer_status_offset(FIXED_PARTITION_ID(slot1_partition));
+	uint32_t mcuboot_capacity = trailer_offset < 0 || (size_t)trailer_offset <= image_offset ?
+		0 : (uint32_t)trailer_offset - image_offset;
+	if (area_err || trailer_offset < 0 || (size_t)trailer_offset <= image_offset ||
+	    image_size == 0 || image_size > mcuboot_capacity) {
+		if (!area_err) {
+			flash_area_close(secondary);
+		}
+		LOG_ERR("RCV OTA: invalid MCUboot image size %u (capacity %d, err %d)",
+			image_size, (int)mcuboot_capacity, area_err);
+		rcv_ota.state = RCV_OTA_ERROR;
+		rcv_ota.error_code = OTA_STATUS_SIZE_ERROR;
+		rcv_ota_send_status();
+		return;
+	}
+#else
 	if (image_size == 0 || image_size > RCV_OTA_MAX_IMAGE_SIZE) {
 		LOG_ERR("RCV OTA: invalid image size %u (max %u)", image_size, RCV_OTA_MAX_IMAGE_SIZE);
 		rcv_ota.state = RCV_OTA_ERROR;
@@ -387,10 +444,14 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 		rcv_ota_send_status();
 		return;
 	}
+#endif
 
 	/* Validate board target */
 	const char *my_board = RCV_BOARD_TARGET_STRING;
 	if (strncmp(board_target, my_board, OTA_BOARD_TARGET_MAX) != 0) {
+#if RCV_OTA_USE_MCUBOOT
+		flash_area_close(secondary);
+#endif
 		LOG_ERR("RCV OTA: board mismatch (got '%s', expected '%s')", board_target, my_board);
 		rcv_ota.state = RCV_OTA_ERROR;
 		rcv_ota.error_code = OTA_STATUS_BOARD_MISMATCH;
@@ -400,6 +461,16 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 
 	/* Validate flash base — allow lower or equal base (e.g., SoftDevice → no-SD).
 	 * Block higher base: target firmware expects SoftDevice not present. */
+#if RCV_OTA_USE_MCUBOOT
+	if (flash_base != 0) {
+		flash_area_close(secondary);
+		LOG_ERR("RCV OTA: MCUboot update image must use flash base 0");
+		rcv_ota.state = RCV_OTA_ERROR;
+		rcv_ota.error_code = OTA_STATUS_SIZE_ERROR;
+		rcv_ota_send_status();
+		return;
+	}
+#else
 	if (flash_base != 0 && flash_base < 0x1000) {
 		LOG_ERR("RCV OTA: flash base 0x%X below MBR (minimum 0x1000)", flash_base);
 		rcv_ota.state = RCV_OTA_ERROR;
@@ -407,6 +478,7 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 		rcv_ota_send_status();
 		return;
 	}
+#endif
 	if (flash_base != 0 && flash_base > RCV_OTA_FLASH_BASE) {
 		LOG_ERR("RCV OTA: flash base 0x%X > running base 0x%X — "
 			"target firmware requires SoftDevice not present",
@@ -426,6 +498,11 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 	}
 
 	/* Calculate staging area (page-aligned, at end of app partition) */
+#if RCV_OTA_USE_MCUBOOT
+	uint32_t staging_base = secondary->fa_off + image_offset;
+	uint32_t secondary_size = secondary->fa_size;
+	flash_area_close(secondary);
+#else
 	uint32_t image_pages = (image_size + RCV_OTA_FLASH_PAGE_SIZE - 1) / RCV_OTA_FLASH_PAGE_SIZE;
 	uint32_t staging_base = RCV_OTA_FLASH_END - (image_pages * RCV_OTA_FLASH_PAGE_SIZE);
 	staging_base &= ~(RCV_OTA_FLASH_PAGE_SIZE - 1);
@@ -441,6 +518,7 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 		rcv_ota_send_status();
 		return;
 	}
+#endif
 
 	/* Initialize state */
 	memset(&rcv_ota, 0, sizeof(rcv_ota));
@@ -449,16 +527,31 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 	rcv_ota.total_packets = total_packets;
 	rcv_ota.staging_base = staging_base;
 	rcv_ota.page_buf_flash_addr = staging_base;
-	rcv_ota.target_flash_base = (flash_base != 0) ? flash_base : RCV_OTA_FLASH_BASE;
+	rcv_ota.target_flash_base = RCV_OTA_USE_MCUBOOT ? 0 :
+		((flash_base != 0) ? flash_base : RCV_OTA_FLASH_BASE);
 	rcv_ota.state = RCV_OTA_READY;
 	memset(rcv_ota.page_buf, 0xFF, sizeof(rcv_ota.page_buf));
 
+#if !RCV_OTA_USE_MCUBOOT
 	if (rcv_ota.target_flash_base != RCV_OTA_FLASH_BASE) {
 		LOG_WRN("RCV OTA: Cross-base update: running at 0x%X, target at 0x%X",
 			RCV_OTA_FLASH_BASE, rcv_ota.target_flash_base);
 	}
+#endif
 
+#if RCV_OTA_USE_MCUBOOT
+	int erase_err = flash_flatten(flash_dev, staging_base, secondary_size);
+	if (erase_err) {
+		LOG_ERR("RCV OTA: failed to erase MCUboot secondary slot: %d", erase_err);
+		rcv_ota.state = RCV_OTA_ERROR;
+		rcv_ota.error_code = OTA_STATUS_FLASH_ERROR;
+		rcv_ota_send_status();
+		return;
+	}
+	LOG_INF("RCV OTA: MCUboot update image at 0x%05X", staging_base);
+#else
 	LOG_INF("RCV OTA: staging at 0x%05X (%u pages)", staging_base, image_pages);
+#endif
 
 	bl_settings_prepared = false;
 
@@ -522,6 +615,26 @@ static void rcv_ota_handle_data(const uint8_t *data, size_t len)
 
 	/* Accumulate data into page buffer */
 	const uint8_t *payload = &data[4];
+	if (rcv_ota.bytes_written == 0 && payload_len >= sizeof(uint32_t)) {
+		bool mcuboot_image = sys_get_le32(payload) == 0x96F3B83D;
+#if RCV_OTA_USE_MCUBOOT
+		if (!mcuboot_image) {
+			LOG_ERR("RCV OTA: MCUboot update image header is missing");
+			rcv_ota.state = RCV_OTA_ERROR;
+			rcv_ota.error_code = OTA_STATUS_VERIFY_FAIL;
+			rcv_ota_send_status();
+			return;
+		}
+#else
+		if (mcuboot_image) {
+			LOG_ERR("RCV OTA: MCUboot image is incompatible with this bootloader");
+			rcv_ota.state = RCV_OTA_ERROR;
+			rcv_ota.error_code = OTA_STATUS_VERIFY_FAIL;
+			rcv_ota_send_status();
+			return;
+		}
+#endif
+	}
 	size_t copied = 0;
 
 	while (copied < payload_len) {
@@ -559,6 +672,14 @@ static void rcv_ota_handle_data(const uint8_t *data, size_t len)
 static void rcv_ota_handle_verify(void)
 {
 	if (rcv_ota.state != RCV_OTA_RECEIVING && rcv_ota.state != RCV_OTA_READY) {
+		rcv_ota_send_status();
+		return;
+	}
+	if (rcv_ota.bytes_written != rcv_ota.image_size) {
+		LOG_ERR("RCV OTA: image incomplete (%u/%u bytes)",
+			rcv_ota.bytes_written, rcv_ota.image_size);
+		rcv_ota.state = RCV_OTA_ERROR;
+		rcv_ota.error_code = OTA_STATUS_SEQ_ERROR;
 		rcv_ota_send_status();
 		return;
 	}
@@ -652,15 +773,17 @@ static void rcv_ota_writer_fn(void *p1, void *p2, void *p3)
 
 		struct page_write_req *req = &page_write_reqs[cmd];
 		uint32_t addr = req->addr;
+		int err;
 
-		/* Erase page */
-		int err = flash_erase(flash_dev, addr, RCV_OTA_FLASH_PAGE_SIZE);
+#if !RCV_OTA_USE_MCUBOOT
+		err = flash_erase(flash_dev, addr, RCV_OTA_FLASH_PAGE_SIZE);
 		if (err) {
 			LOG_ERR("RCV OTA: flash erase failed at 0x%05X (err %d)", addr, err);
 			writer_error = true;
 			k_sem_give(slot_sems[cmd]);
 			continue;
 		}
+#endif
 
 		/* Write data */
 		err = flash_write(flash_dev, addr, req->data, req->len);
@@ -769,8 +892,24 @@ static void rcv_ota_do_activate(void)
 {
 	LOG_WRN("RCV OTA: activating new firmware...");
 
+#if RCV_OTA_USE_MCUBOOT
+	int err = boot_request_upgrade(BOOT_UPGRADE_TEST);
+	if (err) {
+		LOG_ERR("RCV OTA: failed to request MCUboot test upgrade: %d", err);
+		rcv_ota.state = RCV_OTA_ERROR;
+		rcv_ota.error_code = OTA_STATUS_FLASH_ERROR;
+		rcv_ota_send_status();
+		return;
+	}
+	rcv_ota.state = RCV_OTA_COMPLETE;
+	rcv_ota_send_status();
+	k_msleep(100);
+	sys_reboot(SYS_REBOOT_COLD);
+	return;
+#endif
+
 	/* Prepare bootloader settings */
-#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+#if (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER) && !CONFIG_BOOTLOADER_MCUBOOT
 	/* Bootloader needs settings page update to validate the new app */
 	uint16_t crc16 = 0xFFFF;
 	uint8_t buf[256];

@@ -52,6 +52,8 @@
 #define RCV_HID_OP_TRACKER_CH_ALL 218
 #define RCV_HID_OP_TRACKER_CH_CLR 219
 #define RCV_HID_OP_NOP            220
+#define RCV_HID_OP_COLLECT_BATCH_START 221
+#define RCV_HID_OP_COLLECT_BATCH_STOP  222
 
 /* HID OTA types occupy 0xF0–0xF7; never assign dongle opcodes here. */
 #define RCV_HID_OTA_TYPE_MIN 0xF0

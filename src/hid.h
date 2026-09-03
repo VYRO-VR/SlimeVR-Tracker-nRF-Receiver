@@ -27,6 +27,9 @@
 
 void hid_write_packet_n(const uint8_t *data, uint8_t rssi);
 uint32_t hid_get_current_tps(void);
+uint32_t hid_get_total_drop_count(void);
+uint32_t hid_get_total_tracker_drop_count(uint8_t tracker_id);
+
 void hid_reset_rssi_smooth(uint8_t tracker_id);
 void hid_reset_all_rssi_smooth(void);
 

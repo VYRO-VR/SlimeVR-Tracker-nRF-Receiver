@@ -19,6 +19,7 @@ void sys_write(uint16_t id, void* ptr, const void* data, size_t len);
 void sys_read(uint16_t id, void* data, size_t len);
 
 bool button_read(void);
+bool button_read_filtered(void);
 void sys_request_system_off(void);
 void sys_request_system_reboot(void);
 

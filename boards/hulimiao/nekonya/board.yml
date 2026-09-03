@@ -3,6 +3,7 @@
 
 board:
   name: nekonya_uf2
+  full_name: NekoNya
   vendor: hulimiao
   socs:
     - name: nrf52833

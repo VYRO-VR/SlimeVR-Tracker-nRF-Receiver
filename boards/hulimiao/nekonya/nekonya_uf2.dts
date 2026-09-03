@@ -41,7 +41,7 @@
     };
 
     nrf_radio_fem: at2401c {
-        compatible = "generic-fem-two-ctrl-pins";
+        compatible = "radio-fem-two-ctrl-pins";
         ctx-gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
         ctx-settle-time-us = <1>;
         crx-gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;

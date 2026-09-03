@@ -28,13 +28,20 @@ uint8_t rcv_cmd_stats(uint32_t duration_seconds);
 uint8_t rcv_cmd_resetstats(void);
 uint8_t rcv_cmd_collect_start(uint8_t tracker_id);
 uint8_t rcv_cmd_collect_stop(void);
+uint8_t rcv_cmd_collect_batch_start(uint16_t rate_hz);
+uint8_t rcv_cmd_collect_batch_stop(void);
 uint8_t rcv_cmd_reboot(void);
 uint8_t rcv_cmd_dfu(bool ota);
 uint8_t rcv_cmd_tracker_channel_all(uint8_t channel);
 uint8_t rcv_cmd_tracker_channel_clear_all(void);
 
-/* Queue ESB PONG remote flag. target_id RCV_HID_TARGET_ALL = all active. */
+/* Queue ESB PONG remote flag. target_id RCV_HID_TARGET_ALL = all active.
+ * TEST_MODE_ON/OFF are rejected here; use the test-specific helpers below. */
 uint8_t rcv_cmd_remote_flag(uint8_t target_id, uint8_t pong_flag);
+/* Queue TEST_MODE_ON with optional target TPS (0 = tracker default). */
+uint8_t rcv_cmd_remote_test_on(uint8_t target_id, uint16_t tps);
+/* Queue TEST_MODE_OFF. */
+uint8_t rcv_cmd_remote_test_off(uint8_t target_id);
 
 /* sens set / sens auto helpers */
 uint8_t rcv_cmd_remote_sens_set(uint8_t target_id, float x, float y, float z);

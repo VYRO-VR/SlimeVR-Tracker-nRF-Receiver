@@ -122,35 +122,19 @@ jobs:
             zephyr-workspace/tools
           key: west-workspace-${{ steps.generate-vars.outputs.sdk-hash }}
 
-      - name: 📦 Cache PIP Requirements
-        id: cache-pip
+      - name: 📦 Cache Python venv
+        id: cache-venv
         uses: actions/cache@v5
         with:
           path: ~/.venv
-          key: venv-pip-${{ env.ZEPHYR_SDK_VERSION }}
-
-      - name: 📦 Restore Python venv
-        if: steps.cache-pip.outputs.cache-hit != 'true'
-        id: restore-venv
-        uses: actions/cache/restore@v5
-        with:
-          path: ~/.venv
-          key: venv-${{ env.ZEPHYR_SDK_VERSION }}
+          key: venv-bootstrap-${{ env.ZEPHYR_SDK_VERSION }}
 
       - name: 🐍 Setup Python venv + West
         id: setup-venv
-        if: ${{ steps.cache-pip.outputs.cache-hit != 'true' && steps.restore-venv.outputs.cache-hit != 'true' }}
+        if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
           python3 -m venv ~/.venv
           ~/.venv/bin/pip install west ninja
-
-      - name: 📦 Cache Python venv
-        if: steps.restore-venv.outputs.cache-hit != 'true'
-        id: cache-venv
-        uses: actions/cache/save@v5
-        with:
-          path: ~/.venv
-          key: venv-${{ env.ZEPHYR_SDK_VERSION }}
 
       - name: ♻️ Initialize Zephyr Workspace
         id: init-west
@@ -164,12 +148,22 @@ jobs:
           west update --narrow -o=--depth=1
           west zephyr-export
 
-      - name: 🐍 Install Zephyr Python Requirements
+      - name: 📦 Cache PIP Requirements
+        id: cache-pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.venv
+          key: venv-pip-${{ env.ZEPHYR_SDK_VERSION }}-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements*.txt', 'zephyr-workspace/nrf/scripts/requirements-build.txt', 'zephyr-workspace/bootloader/mcuboot/scripts/requirements.txt') }}
+
+      - name: 🐍 Install NCS, Zephyr, and MCUboot Python Requirements
         id: install-pip
         if: steps.cache-pip.outputs.cache-hit != 'true'
         run: |
           cd zephyr-workspace
-          ~/.venv/bin/pip install -r zephyr/scripts/requirements.txt
+          ~/.venv/bin/pip install \
+            -r zephyr/scripts/requirements.txt \
+            -r nrf/scripts/requirements-build.txt \
+            -r bootloader/mcuboot/scripts/requirements.txt
 
       - name: 📦 Cache Repository
         id: cache-repository
@@ -192,7 +186,6 @@ jobs:
 
   build:
     needs: setup
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -224,6 +217,8 @@ jobs:
                   {boardname: "foxpromicro_rfek_uf2/nrf52840", filename: "SlimeNRF_FoxProMicro_RFEK_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "mochi_uf2/nrf52833", filename: "SlimeNRF_Mochi_Receiver"},
                   {boardname: "mochi_uf2/nrf52833", filename: "SlimeNRF_Mochi_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
+                  {boardname: "estenova_r1_uf2/nrf52840", filename: "SlimeNRF_Estenova_Receiver"},
+                  {boardname: "estenova_r1_uf2/nrf52840", filename: "SlimeNRF_Estenova_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                 ]
     runs-on: ubuntu-latest
     steps:
@@ -272,12 +267,12 @@ jobs:
           key: west-workspace-${{ needs.setup.outputs.sdk-hash }}
           fail-on-cache-miss: true
 
-      - name: 📦 Restore PIP Requirements
-        id: restore-pip
+      - name: 📦 Restore Python venv
+        id: restore-venv
         uses: actions/cache/restore@v5
         with:
           path: ~/.venv
-          key: venv-pip-${{ env.ZEPHYR_SDK_VERSION }}
+          key: venv-pip-${{ env.ZEPHYR_SDK_VERSION }}-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements*.txt', 'zephyr-workspace/nrf/scripts/requirements-build.txt', 'zephyr-workspace/bootloader/mcuboot/scripts/requirements.txt') }}
           fail-on-cache-miss: true
 
       - name: ♻️ Register Zephyr Workspace

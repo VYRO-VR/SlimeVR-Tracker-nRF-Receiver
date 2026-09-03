@@ -12,7 +12,7 @@ Sends firmware to a tracker via the receiver's USB HID interface.
 Data flow: PC → HID OUT → Receiver → ESB ACK → Tracker
 
 Usage:
-    python esb_ota.py <firmware.uf2> --tracker <id> [--board <board_target>]
+    python esb_ota.py <firmware.uf2|firmware.signed.bin> --tracker <id> [--board <board_target>]
     python esb_ota.py --info --tracker <id>
     python esb_ota.py --abort
 
@@ -120,6 +120,7 @@ class FirmwareImage:
     base_address: int
     board_target: str  # From UF2 metadata or user override
     crc32: int
+    mcuboot_image: bool = False
 
 
 def parse_uf2(path: Path, flash_offset: int = 0x1000) -> FirmwareImage:
@@ -267,12 +268,23 @@ def parse_hex(path: Path, flash_offset: int = 0x1000) -> FirmwareImage:
 
 
 def parse_firmware(path: Path, flash_offset: int = 0x1000) -> FirmwareImage:
-    """Auto-detect firmware format (UF2 or HEX) and parse."""
+    """Auto-detect UF2, HEX, or an MCUboot update binary."""
     suffix = path.suffix.lower()
     if suffix == '.uf2':
         return parse_uf2(path, flash_offset)
     elif suffix in ('.hex', '.ihex'):
         return parse_hex(path, flash_offset)
+    elif suffix == '.bin':
+        data = path.read_bytes()
+        if len(data) < 32 or struct.unpack_from("<I", data, 0)[0] != 0x96F3B83D:
+            raise ValueError("BIN is not an MCUboot update image")
+        return FirmwareImage(
+            data=data,
+            base_address=0,
+            board_target="",
+            crc32=zlib.crc32(data) & 0xFFFFFFFF,
+            mcuboot_image=True,
+        )
     else:
         # Try to detect by content
         with open(path, 'rb') as f:
@@ -589,7 +601,12 @@ class OTAClient:
         flash_base_raw = struct.unpack_from(">H", info_data, 63)[0]
         flash_base = flash_base_raw << 12
 
-        bl_types = {0: "none", 1: "adafruit_uf2", 2: "nrf5_opendfu"}
+        bl_types = {
+            0: "none",
+            1: "adafruit_uf2",
+            2: "nrf5_opendfu",
+            3: "mcuboot",
+        }
 
         return {
             "version": f"{major}.{minor}.{patch}",
@@ -1340,6 +1357,10 @@ Examples:
                     print("    preventing in-place firmware copy. Update via SWD or DFU instead.")
                     sys.exit(1)
 
+                if (info.get("bootloader") == "mcuboot") != firmware.mcuboot_image:
+                    print("\n  ERROR: MCUboot targets require an update BIN; other targets require UF2/HEX.")
+                    sys.exit(1)
+
                 # Validate flash base
                 rcv_base = info.get("flash_base", 0)
                 if rcv_base == 0 and looks_like_sd_plus_app(firmware, 0x27000):
@@ -1397,6 +1418,11 @@ Examples:
                     if info.get("bootloader") == "nrf5_opendfu":
                         print(f"\n  ⚠ Tracker {tid} has nRF5 OpenDFU bootloader — OTA not supported (ACL flash protection).")
                         print(f"    Update via SWD or DFU instead. Skipping.")
+                        continue
+
+                    if (info.get("bootloader") == "mcuboot") != firmware.mcuboot_image:
+                        print(f"\n  ERROR: Tracker {tid} bootloader and firmware format do not match.")
+                        print("    MCUboot requires an update BIN; UF2/OpenDFU requires UF2/HEX.")
                         continue
 
                     # Validate flash base address
