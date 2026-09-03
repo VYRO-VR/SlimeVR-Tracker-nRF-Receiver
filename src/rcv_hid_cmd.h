@@ -134,6 +134,8 @@ static inline bool rcv_hid_opcode_is_pong_flag(uint8_t op)
 	case ESB_PONG_FLAG_SENS_AUTO:
 	case ESB_PONG_FLAG_MAG_AUTO_ON:
 	case ESB_PONG_FLAG_MAG_AUTO_OFF:
+	case ESB_PONG_FLAG_MAG_HOLD:
+	case ESB_PONG_FLAG_MAG_UNHOLD:
 	case ESB_PONG_FLAG_OTA_QUERY_INFO:
 	case ESB_PONG_FLAG_OTA_ABORT:
 	case ESB_PONG_FLAG_OTA_SUPPRESS:

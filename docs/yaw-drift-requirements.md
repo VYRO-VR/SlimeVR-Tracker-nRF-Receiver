@@ -82,49 +82,76 @@ No new code expected. Verify and, if needed, correct:
    own `shared/config.ts` as a single source of truth, so any change here is a
    breaking change for the GUI and must be called out.
 
-### R2 — Report sens-cal state and result back to the host (firmware task F3)
+### R2 — Report sens-cal state and result back to the host (firmware task F3) — **done**
 
-Today `cal_sens.c` on the tracker reports success, failure and the computed
-scale only via `printk` to the *tracker's own* serial console. Nothing comes
-back over ESB, so Preflight v1 has to infer the outcome from phase timeouts
-plus a verification spin. This requirement removes that inference.
+`cal_sens.c` used to report success, failure and the computed scale only via
+`printk` to the *tracker's own* serial console, so Preflight v1 would have had
+to infer the outcome from phase timeouts. The tracker now sends a dedicated
+report and this receiver forwards it, removing that inference.
 
-Receiver side, once the tracker emits the data:
+Wire format is **stream packet type 6**, a standalone 17-byte ESB frame
+(16 bytes + sequence byte). Payload is 7 bytes from `data[2]`:
 
-- Extend the remote-confirm path (`esb_set_remote_confirm_cb`,
-  `src/connection/esb.c:3552`) or the status sub-packet to carry calibration
-  state plus a result code and the computed scale.
-- Forward it to the host as HID so Preflight can consume it.
+| b0 | b1 | b2 | b3 | b4 | b5 | b6..b7 | b8..b9 | b10..b15 |
+|---|---|---|---|---|---|---|---|---|
+| 6 | id | phase | result | axis | seq | `scale_q12` | `progress` | resv |
 
-Two constraints to design against:
+`scale_q12` and `progress` are little-endian `uint16`; `scale = scale_q12 /
+4096.0` and `progress` is integrated absolute rotation in whole degrees
+(divide by 360 for a turn counter). Enum values are documented next to the
+packet table in `src/hid.c` and are a wire contract — never renumber, only
+append. Cadence is 2 Hz during a run plus a 10 s linger after a terminal
+result.
 
-- **The composite status sub-packet (type 3) carries only 2 bytes** from the
-  tracker (`src/connection/esb.c:2391`). It is not free space — the receiver
-  already overwrites `pkt[4]`/`pkt[5]` with its own packet-loss counters
-  (`src/connection/esb.c:2417`). Bytes 6–14 of the reconstructed 16-byte HID
-  packet are reserved and available, but widening the *ESB* sub-packet means
-  changing `sub_len` on both sides in lockstep.
-- **PONG payload space.** `ESB_PONG_LEN` is 13 (`src/connection/esb.h:33`) and
-  the SENS_AUTO ack already uses `data[3..5]`, leaving `data[6]` and
-  `data[8..11]` zeroed and free.
+**Receiver behaviour.** No forwarding code was needed: the standalone
+length-17 path already forwards any stream type ≤ 223 to HID unchanged
+(`src/connection/esb.c:2242`), so type 6 reaches the host through the existing
+sequence-checked path. `src/hid.c` gained the layout documentation only.
 
-Estimated at roughly a dozen lines on each side.
+Two things this deliberately does **not** do:
 
-### R3 — `ESB_PONG_FLAG_MAG_HOLD` / `MAG_UNHOLD` (firmware task F1)
+- **Type 6 is never added to the composite (`0xFE`) length table.** The tracker
+  sends it standalone precisely because an unknown sub-type inside a composite
+  cannot be skipped. The receiver's composite parser already fails safe on an
+  unknown sub-type — it stops parsing the frame rather than mis-offsetting the
+  rest (`src/connection/esb.c:2400-2408`) — and it must stay that way.
+- **The earlier plan to widen the status sub-packet (type 3) was dropped.** It
+  carries only 2 bytes from the tracker and the receiver already overwrites
+  `pkt[4]`/`pkt[5]` with its own packet-loss counters, so it was the wrong
+  vehicle.
 
-A new pair of PONG flags, plumbed the same way as the existing ones: constant in
-`src/connection/esb.h`, name in `esb_pong_flag_name`
-(`src/connection/esb.c:3132`), console verb in `src/console_send.c`, and reuse
-of the flag value as the HID opcode.
+One divergence to be aware of at the host: type 6 in the legacy SlimeVR stream
+protocol meant "reduced precision quat and accel with button and sleep time".
+This tracker firmware does not send that packet, so the type is free here — but
+any host that still parses type 6 the legacy way will misread these reports.
 
-**Next free flag value is `0x36`** — `0x35` is the highest currently assigned
-(`ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF`). Do not reuse `0xF0`–`0xF7`; those are
-HID OTA report types.
+### R3 — `ESB_PONG_FLAG_MAG_HOLD` / `MAG_UNHOLD` (firmware task F1) — **done**
 
-On the tracker the flag sets a runtime bit that forces `magDistDetected = true`,
-skips the new-field acceptance branch, and blocks committing an online mag
-calibration to flash. Crucially it does **no** fusion restart and **no** NVS
-write, and it is revertible.
+| Flag | Value |
+|---|---|
+| `ESB_PONG_FLAG_MAG_HOLD` | `0x27` |
+| `ESB_PONG_FLAG_MAG_UNHOLD` | `0x28` |
+
+Neither carries PONG payload bytes — `data[3..11]` are untouched, so the normal
+time-sync path applies. Both sit outside `0x30`–`0x33` (the OTA range the
+tracker executes immediately), so they take the standard ~1500 ms deferred
+execution. Acknowledgement is the existing generic echo in PING `data[7]`; no
+new ack handling.
+
+Plumbed the usual way:
+
+- constants in `src/connection/esb.h`
+- names in `esb_pong_flag_name` (`src/connection/esb.c`)
+- allowlisted in `rcv_hid_opcode_is_pong_flag` (`src/rcv_hid_cmd.h`), which
+  gates **both** the HID path and the console path, so the HID opcode is the
+  flag value itself (`0x27` / `0x28`)
+- console verb `send <id|all> mag hold <on|off>` (`src/console_send.c`)
+
+On the tracker the flag makes the fusion backend skip the magnetometer update
+entirely — no heading correction, no new-field adoption — and stops online mag
+calibration collecting samples or committing to flash. There is **no** fusion
+restart, **no** orientation glitch and **no** NVS write, and the hold is not
+persisted: a tracker reboot clears it.
 
 Why a new flag rather than the existing `MAG_ON`/`MAG_OFF` (0x19/0x1A): on the
 tracker, toggling mag suspends the sensor thread, does a full fusion re-init
@@ -132,6 +159,10 @@ tracker, toggling mag suspends the sensor thread, does a full fusion re-init
 and reboots the tracker if the sensor was not initialised. It is not usable as a
 runtime control knob. `MAG_HOLD` is the safe equivalent. **Do not expose
 `MAG_ON`/`MAG_OFF` as the mechanism for any of this work.**
+
+Side effect worth knowing about at the host: while held, the tracker reports mag
+disturbance continuously, so the existing temperature-byte sign-flip shows
+"disturbed" for the duration of the hold.
 
 ### R4 — Carry Phase 3 actuation
 

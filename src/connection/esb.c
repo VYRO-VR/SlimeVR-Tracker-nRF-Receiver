@@ -3214,6 +3214,10 @@ static const char *esb_pong_flag_name(uint8_t flag)
 		return "DATA_COLLECT_BATCH_ON";
 	case ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF:
 		return "DATA_COLLECT_BATCH_OFF";
+	case ESB_PONG_FLAG_MAG_HOLD:
+		return "MAG_HOLD";
+	case ESB_PONG_FLAG_MAG_UNHOLD:
+		return "MAG_UNHOLD";
 	case ESB_PONG_FLAG_OTA_QUERY_INFO:
 		return "OTA_QUERY_INFO";
 	case ESB_PONG_FLAG_OTA_ABORT:

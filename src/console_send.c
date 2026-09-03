@@ -98,13 +98,15 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		cmd_name = "Sensor scan";
 	} else if (strcmp(arg2, "mag") == 0) {
 		if (!arg3) {
-			printk("Usage: send <id|all> mag <on|off|clear|cal|auto on|auto off>\n");
+			printk("Usage: send <id|all> mag <on|off|clear|cal|auto on|auto off|hold on|hold off>\n");
 			printk("  on       - Enable magnetometer\n");
 			printk("  off      - Disable magnetometer\n");
 			printk("  clear    - Clear magnetometer calibration\n");
 			printk("  cal      - Start magnetometer calibration\n");
 			printk("  auto on  - Enable online magnetometer calibration\n");
 			printk("  auto off - Disable online magnetometer calibration\n");
+			printk("  hold on  - Stop the fusion filter trusting the magnetometer\n");
+			printk("  hold off - Resume normal magnetometer fusion\n");
 			return;
 		}
 
@@ -138,8 +140,28 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 				printk("Invalid mag %s argument: %s (use 'on' or 'off')\n", arg3, arg4);
 				return;
 			}
+		} else if (strcmp(arg3, "hold") == 0) {
+			/* Runtime-only: no fusion restart, no NVS write, cleared by a
+			 * tracker reboot. Unlike mag on/off this is safe to toggle. */
+			if (!arg4) {
+				printk("Usage: send <id|all> mag hold <on|off>\n");
+				return;
+			}
+			if (strcmp(arg4, "on") == 0) {
+				mag_cmd = ESB_PONG_FLAG_MAG_HOLD;
+				mag_name = "Magnetometer hold enable";
+			} else if (strcmp(arg4, "off") == 0) {
+				mag_cmd = ESB_PONG_FLAG_MAG_UNHOLD;
+				mag_name = "Magnetometer hold disable";
+			} else {
+				printk("Invalid mag hold argument: %s (use 'on' or 'off')\n", arg4);
+				return;
+			}
 		} else {
-			printk("Unknown mag subcommand: %s (use 'on', 'off', 'clear', 'cal' or 'auto')\n", arg3);
+			printk(
+				"Unknown mag subcommand: %s (use 'on', 'off', 'clear', 'cal', 'auto' or 'hold')\n",
+				arg3
+			);
 			return;
 		}
 
