@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 board:
-  name: kounolab_dongle_uf2
-  vendor: kounolab
+  name: estenova_r1_uf2
+  full_name: Estenova R1
+  vendor: estenova
   socs:
-    - name: nrf52820
+    - name: nrf52840

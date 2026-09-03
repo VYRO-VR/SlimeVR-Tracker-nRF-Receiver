@@ -41,9 +41,14 @@ void data_collect_stop(void);
 bool data_collect_is_active(void);
 uint8_t data_collect_get_target_id(void);
 
+/* Runtime control for simultaneous raw collection from selected trackers. */
+void data_collect_batch_start(uint32_t mask, uint16_t rate_hz);
+void data_collect_batch_stop(void);
+bool data_collect_batch_is_active(void);
+bool data_collect_batch_is_target(uint8_t tracker_id);
+
 /* Check if data collection is active and this tracker is the target */
 bool data_collect_is_target(uint8_t tracker_id);
-
 #else /* !CONFIG_DATA_COLLECT */
 
 static inline int data_collect_init(void) { return 0; }
@@ -52,8 +57,11 @@ static inline void data_collect_start(uint8_t tracker_id) { (void)tracker_id; }
 static inline void data_collect_stop(void) {}
 static inline bool data_collect_is_active(void) { return false; }
 static inline uint8_t data_collect_get_target_id(void) { return 0; }
+static inline void data_collect_batch_start(uint32_t mask, uint16_t rate_hz) { (void)mask; (void)rate_hz; }
+static inline void data_collect_batch_stop(void) {}
+static inline bool data_collect_batch_is_active(void) { return false; }
+static inline bool data_collect_batch_is_target(uint8_t tracker_id) { (void)tracker_id; return false; }
 static inline bool data_collect_is_target(uint8_t tracker_id) { (void)tracker_id; return false; }
-
 #endif /* CONFIG_DATA_COLLECT */
 
 #endif /* SLIMENRF_DATA_COLLECT_H */

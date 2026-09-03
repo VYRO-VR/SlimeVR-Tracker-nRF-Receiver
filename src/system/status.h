@@ -30,7 +30,8 @@ enum sys_status {
 	SYS_STATUS_USB_CONNECTED = 8,
 	SYS_STATUS_PLUGGED = 16,
 	SYS_STATUS_BUTTON_PRESSED = 32,
-	SYS_STATUS_PAIRING_MODE = 64
+	SYS_STATUS_PAIRING_MODE = 64,
+	SYS_STATUS_SERIAL_ACTIVE = 128,
 };
 
 void set_status(enum sys_status status, bool set);

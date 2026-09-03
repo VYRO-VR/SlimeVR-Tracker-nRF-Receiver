@@ -17,8 +17,8 @@
 
 #include <hal/nrf_radio.h>
 
-#define RSSI_SCAN_FIRST_CHANNEL 1
-#define RSSI_SCAN_LAST_CHANNEL 100
+#define RSSI_SCAN_FIRST_CHANNEL 0
+#define RSSI_SCAN_LAST_CHANNEL 88
 
 #define RSSI_SCAN_SAMPLES_PER_CH 50
 #define RSSI_SCAN_SWEEPS 200
@@ -123,13 +123,13 @@ static bool better_channel(
 	uint8_t lowest_a,
 	uint8_t ch_b,
 	uint8_t lowest_b,
+	bool ch_b_valid,
 	uint8_t current_ch
 )
 {
-	if (ch_b == 0) {
+	if (!ch_b_valid) {
 		return true;
 	}
-
 	// Primary: maximize lowest (higher = cleaner).
 	if (lowest_a > lowest_b) {
 		return true;
@@ -175,17 +175,22 @@ void rssi_scan_run_and_print(void)
 	// sweep_min[sweep][ch] = per-sweep minimum RSSI sample for that channel.
 	static uint8_t sweep_min[RSSI_SCAN_SWEEPS][RSSI_SCAN_LAST_CHANNEL + 1];
 	static uint8_t score_lowest[RSSI_SCAN_LAST_CHANNEL + 1];
+	static bool measured[RSSI_SCAN_LAST_CHANNEL + 1];
 
 	for (uint8_t ch = RSSI_SCAN_FIRST_CHANNEL; ch <= RSSI_SCAN_LAST_CHANNEL; ch++) {
 		for (int sweep = 0; sweep < RSSI_SCAN_SWEEPS; sweep++) {
 			sweep_min[sweep][ch] = RSSI_SAMPLE_MAX;
 		}
-		score_lowest[ch] = 0;
+		measured[ch] = false;
 	}
 
 	for (int sweep = 0; sweep < RSSI_SCAN_SWEEPS; sweep++) {
 		// printk("RSSI scan sweep %d/%d...\n", sweep + 1, RSSI_SCAN_SWEEPS);
 		for (uint8_t ch = RSSI_SCAN_FIRST_CHANNEL; ch <= RSSI_SCAN_LAST_CHANNEL; ch++) {
+			if (!esb_channel_is_allowed(ch)) {
+				continue; // only preferred channels
+			}
+			measured[ch] = true;
 			sweep_min[sweep][ch] = rssi_scan_channel_measure_min_n(ch, RSSI_SCAN_SAMPLES_PER_CH);
 		}
 
@@ -199,6 +204,9 @@ void rssi_scan_run_and_print(void)
 
 	// Reduce sweeps into per-channel scores (only lowest).
 	for (uint8_t ch = RSSI_SCAN_FIRST_CHANNEL; ch <= RSSI_SCAN_LAST_CHANNEL; ch++) {
+		if (!measured[ch]) {
+			continue;
+		}
 		uint8_t lowest = RSSI_SAMPLE_MAX;
 
 		for (int sweep = 0; sweep < RSSI_SCAN_SWEEPS; sweep++) {
@@ -212,16 +220,31 @@ void rssi_scan_run_and_print(void)
 	}
 
 	uint8_t current_ch = get_current_effective_channel();
-	uint8_t recommended = 0;
+
+	/* Candidate list: measured channels only (score != 0xFF sentinel). */
+	enum { NUM_CH = RSSI_SCAN_LAST_CHANNEL - RSSI_SCAN_FIRST_CHANNEL + 1 };
+	uint8_t cand_ch[NUM_CH];
+	int cand_count = 0;
 	for (uint8_t ch = RSSI_SCAN_FIRST_CHANNEL; ch <= RSSI_SCAN_LAST_CHANNEL; ch++) {
+		if (measured[ch]) {
+			cand_ch[cand_count++] = ch;
+		}
+	}
+
+	uint8_t recommended = 0;
+	bool has_recommended = false;
+	for (int i = 0; i < cand_count; i++) {
+		uint8_t ch = cand_ch[i];
 		if (better_channel(
 				ch,
 				score_lowest[ch],
 				recommended,
-				recommended ? score_lowest[recommended] : 0,
+				has_recommended ? score_lowest[recommended] : 0,
+				has_recommended,
 				current_ch
 			)) {
 			recommended = ch;
+			has_recommended = true;
 		}
 	}
 
@@ -232,13 +255,12 @@ void rssi_scan_run_and_print(void)
 		score_lowest[recommended]
 	);
 
-	// Sort all channels by lowest using simple insertion sort.
-	enum { NUM_CH = RSSI_SCAN_LAST_CHANNEL - RSSI_SCAN_FIRST_CHANNEL + 1 };
+	// Sort measured channels only, using simple insertion sort.
 	uint8_t sorted_ch[NUM_CH];
-	for (int i = 0; i < NUM_CH; i++) {
-		sorted_ch[i] = RSSI_SCAN_FIRST_CHANNEL + i;
+	for (int i = 0; i < cand_count; i++) {
+		sorted_ch[i] = cand_ch[i];
 	}
-	for (int i = 1; i < NUM_CH; i++) {
+	for (int i = 1; i < cand_count; i++) {
 		uint8_t key = sorted_ch[i];
 		int j = i - 1;
 		while (j >= 0
@@ -247,6 +269,7 @@ void rssi_scan_run_and_print(void)
 				   score_lowest[key],
 				   sorted_ch[j],
 				   score_lowest[sorted_ch[j]],
+				   true,
 				   current_ch
 			   )) {
 			sorted_ch[j + 1] = sorted_ch[j];
@@ -259,10 +282,10 @@ void rssi_scan_run_and_print(void)
 	// Format: "CH(WST)" where WST is lowest (min across all samples).
 	printk("All channels sorted by RSSI (lower is better):\n");
 	enum { PER_LINE = 8 };
-	for (int i = 0; i < NUM_CH; i++) {
+	for (int i = 0; i < cand_count; i++) {
 		uint8_t ch = sorted_ch[i];
 		printk("%3u (-%2d dBm)", ch, score_lowest[ch]);
-		if ((i + 1) % PER_LINE == 0 || i == NUM_CH - 1) {
+		if ((i + 1) % PER_LINE == 0 || i == cand_count - 1) {
 			printk("\n");
 			k_msleep(20);
 		} else {

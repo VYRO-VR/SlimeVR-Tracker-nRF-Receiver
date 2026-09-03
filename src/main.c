@@ -28,12 +28,29 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
-
-#define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-#define DFU_DBL_RESET_MEM 0x20007F7C
-#define DFU_DBL_RESET_APP 0x4ee5677e
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+#include <zephyr/dfu/mcuboot.h>
+#endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+static void mcuboot_confirm_thread(void)
+{
+	k_sleep(K_SECONDS(60));
+	if (!boot_is_img_confirmed()) {
+		int err = boot_write_img_confirmed();
+		if (err) {
+			LOG_ERR("Failed to confirm MCUboot image: %d", err);
+		} else {
+			LOG_INF("MCUboot test image confirmed");
+		}
+	}
+}
+
+K_THREAD_DEFINE(mcuboot_confirm_thread_id, 512, mcuboot_confirm_thread,
+		NULL, NULL, NULL, 10, 0, 0);
+#endif
 
 int main(void)
 {

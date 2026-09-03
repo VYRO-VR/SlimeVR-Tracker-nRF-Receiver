@@ -34,6 +34,32 @@
 #define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
 #define ESB_COMPOSITE_TYPE 0xFE // Composite packet containing multiple sub-packets
 
+// Reference table for channel picking (see esb.c for the array itself).
+bool esb_channel_is_allowed(uint8_t channel);
+
+/* ---------------------------------------------------------------------------
+ * RF channel storage encoding (NVS byte). User-facing channel is 0-100.
+ *   0xFF -> default channel;  0 -> invalid/legacy -> default;
+ *   128  -> channel 0;        1..100 -> channel value.
+ * Keeps 0 unambiguous as "no setting" across firmware upgrades. */
+#define ESB_RF_CHANNEL_DEFAULT 0xFF
+#define ESB_RF_CHANNEL_ZERO_ENC 128
+
+static inline uint8_t esb_rf_channel_encode(uint8_t channel)
+{
+	return channel == 0 ? ESB_RF_CHANNEL_ZERO_ENC : channel;
+}
+
+static inline uint8_t esb_rf_channel_decode(uint8_t stored)
+{
+	if (stored == ESB_RF_CHANNEL_ZERO_ENC) {
+		return 0; /* channel 0 */
+	}
+	if (stored == ESB_RF_CHANNEL_DEFAULT || stored == 0 || stored > 100) {
+		return ESB_RF_CHANNEL_DEFAULT; /* default (incl. legacy/invalid) */
+	}
+	return stored;
+}
 // Remote command flags for PONG data[7]
 #define ESB_PONG_FLAG_NORMAL 0x00
 #define ESB_PONG_FLAG_SHUTDOWN 0x01
@@ -71,6 +97,8 @@
 #define ESB_PONG_FLAG_DFU_OTA 0x21          // Enter OTA DFU bootloader
 #define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
 #define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON 0x34  // Start batch raw data collection (data[8] = target Hz)
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF 0x35 // Stop batch raw data collection
 #define ESB_PONG_FLAG_SENS_AUTO 0x24        // Auto-calibrate gyro sensitivity
 #define ESB_PONG_FLAG_MAG_AUTO_ON 0x25      // Enable online magnetometer calibration
 #define ESB_PONG_FLAG_MAG_AUTO_OFF 0x26     // Disable online magnetometer calibration
@@ -112,7 +140,10 @@ void esb_reset_pair(void);
 void esb_finish_pair(void);
 void esb_clear(void);
 void esb_reset_tracker_sequence(uint8_t tracker_id);
-void esb_print_all_stats(void);
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+void esb_print_health_snapshot(void);
+#endif
+
 void esb_reset_all_stats(void);
 void esb_write_sync(uint16_t led_clock);
 void esb_receive(void);
@@ -125,8 +156,16 @@ uint32_t esb_get_stats_detailed_remaining(void);        // Get remaining time (0
 
 // Remote command API
 void esb_send_remote_command(uint8_t tracker_id, uint8_t command_flag);
+void esb_send_remote_command_arg(uint8_t tracker_id, uint8_t command_flag, uint8_t arg);
 /* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */
 uint32_t esb_send_remote_command_all(uint8_t command_flag);
+/* Targeted test commands: publish TPS, then queue the flag. Return the
+ * targeted-tracker bitmask; invalidate sticky-all state. */
+uint32_t esb_send_remote_command_test_on(uint8_t tracker_id, uint16_t tps);
+uint32_t esb_send_remote_command_test_off(uint8_t tracker_id);
+/* Active-scan then queue. Return bitmask of targeted tracker ids. Blocks ~1s. */
+uint32_t esb_send_remote_command_test_on_all(uint16_t tps);
+uint32_t esb_send_remote_command_test_off_all(void);
 void esb_send_remote_command_sens(uint8_t tracker_id, float x, float y, float z);
 bool esb_send_remote_command_sens_auto(uint8_t tracker_id, uint8_t axis, uint16_t revolutions);
 /* Active-scan then queue. Returns bitmask of targeted tracker ids. Blocks ~1s. */

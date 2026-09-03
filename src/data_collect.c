@@ -23,6 +23,7 @@
 
 #include "data_collect.h"
 #include "connection/esb.h"
+#include "globals.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -50,6 +51,8 @@ static uint32_t dc_frames_dropped;
 /* Runtime state */
 static bool dc_active;
 static uint8_t dc_target_tracker_id;
+static bool dc_batch_active;
+static uint32_t dc_batch_mask;
 
 /* Timeout: auto-stop if no raw data received for this long */
 #define DC_TIMEOUT_MS 60000
@@ -185,7 +188,21 @@ static K_WORK_DEFINE(dc_timeout_work, dc_timeout_work_handler);
 static void dc_timeout_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	if (!dc_active) return;
+	if (!dc_active && !dc_batch_active) {
+		return;
+	}
+	if (dc_batch_active) {
+		uint32_t mask = dc_batch_mask;
+		data_collect_batch_stop();
+		for (uint8_t tid = 0; tid < MAX_TRACKERS; tid++) {
+			if (mask & BIT(tid)) {
+				esb_send_remote_command(tid, ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF);
+			}
+		}
+		LOG_WRN("Batch data collection timed out (no data for %d s), sent OFF to trackers 0x%08x",
+			DC_TIMEOUT_MS / 1000, (unsigned int)mask);
+		return;
+	}
 	uint8_t tid = dc_target_tracker_id;
 	data_collect_stop();
 	esb_send_remote_command(tid, ESB_PONG_FLAG_DATA_COLLECT_OFF);
@@ -199,7 +216,7 @@ static void dc_timer_handler(struct k_timer *timer)
 	k_work_submit(&dc_tx_kick_work);
 
 	/* Check for data collection timeout */
-	if (dc_active && dc_last_rx_time > 0 &&
+	if ((dc_active || dc_batch_active) && dc_last_rx_time > 0 &&
 	    (k_uptime_get() - dc_last_rx_time) > DC_TIMEOUT_MS) {
 		k_work_submit(&dc_timeout_work);
 	}
@@ -221,10 +238,9 @@ int data_collect_init(void)
 	}
 
 	cdc_ready = true;
-	dc_frames_sent = 0;
-	dc_frames_dropped = 0;
 	dc_active = false;
-
+	dc_batch_active = false;
+	dc_batch_mask = 0;
 	k_timer_start(&dc_timer, K_MSEC(1), K_MSEC(1));
 
 	LOG_INF("Data collection subsystem initialized");
@@ -233,6 +249,8 @@ int data_collect_init(void)
 
 void data_collect_start(uint8_t tracker_id)
 {
+	dc_batch_active = false;
+	dc_batch_mask = 0;
 	dc_target_tracker_id = tracker_id;
 	dc_active = true;
 	dc_frames_sent = 0;
@@ -248,6 +266,26 @@ void data_collect_stop(void)
 		dc_frames_sent, dc_frames_dropped);
 }
 
+void data_collect_batch_start(uint32_t mask, uint16_t rate_hz)
+{
+	dc_active = false;
+	dc_batch_mask = mask;
+	dc_batch_active = mask != 0;
+	dc_frames_sent = 0;
+	dc_frames_dropped = 0;
+	dc_last_rx_time = k_uptime_get();
+	LOG_INF("Batch data collection STARTED mask=0x%08x rate=%u Hz",
+		(unsigned int)mask, rate_hz);
+}
+
+void data_collect_batch_stop(void)
+{
+	dc_batch_active = false;
+	dc_batch_mask = 0;
+	LOG_INF("Batch data collection STOPPED (sent: %u, dropped: %u)",
+		dc_frames_sent, dc_frames_dropped);
+}
+
 bool data_collect_is_active(void)
 {
 	return dc_active;
@@ -256,6 +294,16 @@ bool data_collect_is_active(void)
 uint8_t data_collect_get_target_id(void)
 {
 	return dc_target_tracker_id;
+}
+
+bool data_collect_batch_is_active(void)
+{
+	return dc_batch_active;
+}
+
+bool data_collect_batch_is_target(uint8_t tracker_id)
+{
+	return dc_batch_active && tracker_id < MAX_TRACKERS && (dc_batch_mask & BIT(tracker_id)) != 0;
 }
 
 bool data_collect_is_target(uint8_t tracker_id)

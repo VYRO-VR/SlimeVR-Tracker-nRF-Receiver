@@ -21,13 +21,27 @@
 	THE SOFTWARE.
 */
 #include "usb.h"
+#include "console.h"
 
 #include <hal/nrf_power.h>
 #include <zephyr/kernel.h>
 #include <zephyr/usb/usb_ch9.h>
 #include <zephyr/usb/usbd.h>
+#include <zephyr/drivers/uart.h>
 
+#include <zephyr/logging/log_ctrl.h>
+#include "system/system.h"
+#include "system/status.h"
 #include "thread_priority.h"
+
+#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT)
+#define ADAFRUIT_DFU_MAGIC_SERIAL_ONLY_RESET 0x4E
+
+static void usb_ctrl_thread(void);
+static struct k_thread usb_ctrl_thread_id;
+static K_THREAD_STACK_DEFINE(usb_ctrl_thread_stack, 512);
+static bool usb_ctrl_thread_running;
+static int64_t usb_start_time_ms;
 
 LOG_MODULE_REGISTER(usb, LOG_LEVEL_INF);
 
@@ -227,9 +241,35 @@ static void status_cb(struct usbd_context *const ctx, const struct usbd_msg *con
 	switch (msg->type) {
 	case USBD_MSG_RESET:
 		receiver_usb_set_configured(false);
+		if (usb_ctrl_thread_running) {
+			k_thread_abort(&usb_ctrl_thread_id);
+			usb_ctrl_thread_running = false;
+		}
+		if (get_status(SYS_STATUS_SERIAL_ACTIVE)) {
+			set_status(SYS_STATUS_SERIAL_ACTIVE, false);
+		}
+		console_serial_stop();
+		log_backend_disable(log_backend_get_by_name("log_backend_uart"));
 		break;
 	case USBD_MSG_CONFIGURATION:
 		receiver_usb_set_configured(msg->status != 0);
+		if (msg->status != 0 && !usb_ctrl_thread_running) {
+			usb_ctrl_thread_running = true;
+			k_thread_create(&usb_ctrl_thread_id, usb_ctrl_thread_stack,
+					K_THREAD_STACK_SIZEOF(usb_ctrl_thread_stack),
+					(k_thread_entry_t)usb_ctrl_thread, NULL, NULL, NULL,
+					USB_INIT_THREAD_PRIORITY, 0, K_NO_WAIT);
+		} else if (msg->status == 0) {
+			if (usb_ctrl_thread_running) {
+				k_thread_abort(&usb_ctrl_thread_id);
+				usb_ctrl_thread_running = false;
+			}
+			if (get_status(SYS_STATUS_SERIAL_ACTIVE)) {
+				set_status(SYS_STATUS_SERIAL_ACTIVE, false);
+			}
+			console_serial_stop();
+			log_backend_disable(log_backend_get_by_name("log_backend_uart"));
+		}
 		break;
 	case USBD_MSG_VBUS_READY:
 		ret = usb_enable_device(ctx);
@@ -239,6 +279,15 @@ static void status_cb(struct usbd_context *const ctx, const struct usbd_msg *con
 		break;
 	case USBD_MSG_VBUS_REMOVED:
 		receiver_usb_set_configured(false);
+		if (usb_ctrl_thread_running) {
+			k_thread_abort(&usb_ctrl_thread_id);
+			usb_ctrl_thread_running = false;
+		}
+		if (get_status(SYS_STATUS_SERIAL_ACTIVE)) {
+			set_status(SYS_STATUS_SERIAL_ACTIVE, false);
+		}
+		console_serial_stop();
+		log_backend_disable(log_backend_get_by_name("log_backend_uart"));
 		usb_enabled = false;
 		if (usbd_disable(ctx) != 0) {
 			LOG_ERR("Failed to disable USB device");
@@ -253,6 +302,7 @@ static void status_cb(struct usbd_context *const ctx, const struct usbd_msg *con
 static void usb_init_thread(void)
 {
 	int ret = usbd_setup(status_cb);
+	usb_start_time_ms = k_uptime_get();
 
 	if (ret != 0) {
 		return;
@@ -267,5 +317,54 @@ static void usb_init_thread(void)
 	}
 }
 
+static void usb_ctrl_thread(void)
+{
+	const struct log_backend *const backend = log_backend_get_by_name("log_backend_uart");
+	const struct device *const dev_console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+	uint32_t dtr;
+	uint32_t last_dtr = 0;
+
+#if DFU_EXISTS
+	// Filter only the initial wake/reset fluctuation. A button that remains
+	// held after the startup window is an intentional DFU request.
+	bool enter_dfu = k_uptime_get() - usb_start_time_ms < 100
+		? button_read_filtered()
+		: button_read();
+	if (enter_dfu) {
+		sys_enter_dfu(false);
+	}
+#endif
+
+	// Watch DTR (terminal attached) for SERIAL_ACTIVE status and 1200 baud DFU touch.
+	while (1) {
+		dtr = 0;
+		uart_line_ctrl_get(dev_console, UART_LINE_CTRL_DTR, &dtr);
+		if (dtr == last_dtr) {
+			k_msleep(10);
+			continue;
+		}
+		last_dtr = dtr;
+		if (dtr) {
+			set_status(SYS_STATUS_SERIAL_ACTIVE, true);
+			console_serial_start();
+			log_backend_enable(backend, backend->cb->ctx, CONFIG_LOG_MAX_LEVEL);
+		} else {
+#if CONFIG_BUILD_OUTPUT_UF2
+			// Adafruit UF2 supports the 1200 baud serial-only DFU touch.
+			uint32_t baudrate = 0;
+			uart_line_ctrl_get(dev_console, UART_LINE_CTRL_BAUD_RATE, &baudrate);
+			if (baudrate == 1200) {
+				NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SERIAL_ONLY_RESET;
+				k_msleep(100);
+				sys_request_system_reboot();
+			}
+#endif
+			set_status(SYS_STATUS_SERIAL_ACTIVE, false);
+			console_serial_stop();
+			log_backend_disable(backend);
+		}
+	}
+}
+
 /* below ESB_THREAD_PRIORITY; one-shot USB init must not outrank radio */
-K_THREAD_DEFINE(usb_init_thread_id, 256, usb_init_thread, NULL, NULL, NULL, USB_INIT_THREAD_PRIORITY, 0, 500);
+K_THREAD_DEFINE(usb_init_thread_id, 512, usb_init_thread, NULL, NULL, NULL, USB_INIT_THREAD_PRIORITY, 0, 500);

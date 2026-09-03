@@ -291,6 +291,19 @@ static uint32_t dropped_reports = 0;
 static uint16_t max_dropped_reports = 0;
 /* Per-tracker drop counters; printed from logging thread when detailed stats on. */
 static uint32_t tracker_drops[MAX_TRACKERS] = {0};
+static uint32_t total_dropped_reports = 0;
+static uint32_t total_tracker_drops[MAX_TRACKERS] = {0};
+
+uint32_t hid_get_total_drop_count(void)
+{
+	return total_dropped_reports;
+}
+
+uint32_t hid_get_total_tracker_drop_count(uint8_t tracker_id)
+{
+	return tracker_id < MAX_TRACKERS ? total_tracker_drops[tracker_id] : 0;
+}
+
 
 static void send_report(struct k_work *work)
 {
@@ -743,6 +756,7 @@ void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
 	}
 
 	/* Count only — LOG from hid_dropped_reports_logging thread, never EVENT IRQ. */
+	total_dropped_reports++;
 	dropped_reports++;
 	if (dropped_reports > max_dropped_reports) {
 		max_dropped_reports = dropped_reports;
@@ -751,6 +765,7 @@ void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
 		uint8_t tracker_id = data[1];
 		if (tracker_id < MAX_TRACKERS) {
 			tracker_drops[tracker_id]++;
+			total_tracker_drops[tracker_id]++;
 		}
 	}
 }

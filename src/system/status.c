@@ -60,6 +60,9 @@ void set_status(enum sys_status status, bool set) {
 			case SYS_STATUS_PAIRING_MODE:
 				LOG_INF("Pairing mode active");
 				break;
+			case SYS_STATUS_SERIAL_ACTIVE:
+				LOG_INF("Serial connected");
+				break;
 			default:
 				break;
 		}

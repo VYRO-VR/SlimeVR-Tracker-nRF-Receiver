@@ -1,0 +1,9 @@
+/ {
+	chosen {
+		zephyr,code-partition = &boot_partition;
+	};
+};
+
+&zephyr_udc0 {
+	status = "okay";
+};
