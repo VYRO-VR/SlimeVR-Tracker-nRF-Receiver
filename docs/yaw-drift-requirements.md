@@ -89,12 +89,13 @@ No new code expected. Verify and, if needed, correct:
 to infer the outcome from phase timeouts. The tracker now sends a dedicated
 report and this receiver forwards it, removing that inference.
 
-Wire format is **stream packet type 6**, a standalone 17-byte ESB frame
-(16 bytes + sequence byte). Payload is 7 bytes from `data[2]`:
+Wire format is **stream packet type `0x40`** (`ESB_SENS_CAL_REPORT_TYPE`,
+`src/connection/esb.h`), a standalone 17-byte ESB frame (16 bytes + sequence
+byte). Payload is 7 bytes from `data[2]`:
 
 | b0 | b1 | b2 | b3 | b4 | b5 | b6..b7 | b8..b9 | b10..b15 |
 |---|---|---|---|---|---|---|---|---|
-| 6 | id | phase | result | axis | seq | `scale_q12` | `progress` | resv |
+| `0x40` | id | phase | result | axis | seq | `scale_q12` | `progress` | resv |
 
 `scale_q12` and `progress` are little-endian `uint16`; `scale = scale_q12 /
 4096.0` and `progress` is integrated absolute rotation in whole degrees
@@ -103,10 +104,25 @@ packet table in `src/hid.c` and are a wire contract — never renumber, only
 append. Cadence is 2 Hz during a run plus a 10 s linger after a terminal
 result.
 
-**Receiver behaviour.** No forwarding code was needed: the standalone
-length-17 path already forwards any stream type ≤ 223 to HID unchanged
-(`src/connection/esb.c:2242`), so type 6 reaches the host through the existing
-sequence-checked path. `src/hid.c` gained the layout documentation only.
+**Receiver behaviour.** Two things:
+
+1. **Forward to HID unchanged.** No code was needed: the standalone length-17
+   path already forwards any stream type ≤ 223 to HID through the existing
+   sequence-checked path (`src/connection/esb.c`). SlimeVR Server ignores the
+   type.
+2. **Echo on the console.** Preflight drives the guided calibration over the
+   console CDC and cannot read HID while SlimeVR Server holds that interface,
+   so the same forward path logs one line per report:
+
+   ```
+   Sens cal tracker <id>: phase <p> result <r> axis <a> seq <s> scale <q12> progress <deg>
+   ```
+
+   All fields decimal; `<id>` is the receiver slot, the same id `send <id> …`
+   takes. Preflight matches this with a regex in its `shared/config.ts`, so
+   the format is part of the host contract — change it only with a matching
+   Preflight change. It is a deferred `LOG_INF` at 2 Hz, safe from the ESB
+   event context and negligible in bandwidth.
 
 Two things this deliberately does **not** do:
 
@@ -120,10 +136,15 @@ Two things this deliberately does **not** do:
   `pkt[4]`/`pkt[5]` with its own packet-loss counters, so it was the wrong
   vehicle.
 
-One divergence to be aware of at the host: type 6 in the legacy SlimeVR stream
-protocol meant "reduced precision quat and accel with button and sleep time".
-This tracker firmware does not send that packet, so the type is free here — but
-any host that still parses type 6 the legacy way will misread these reports.
+**Why `0x40` and not type 6.** The first cut of this report used stream type 6
+on the assumption that its legacy meaning was unused. SlimeVR Server's
+`HIDCommon.kt` in fact parses type 6 as `button` (`b2`) plus `sleeptime`
+(`b3..b4`) and sends a tap to its tap-setup handler whenever the low two bits
+of `button` change, so a report on type 6 (phase 1 → 2 → 3 → 5) fired a burst
+of taps — a tracker reset — during every calibration run, and set a bogus
+sleep timer from `result << 8 | axis`. The server ignores stream types it does
+not know, so the report now sits outside its 0–7 range. The legacy type 6 and
+7 rows are back in the `src/hid.c` table with their upstream meanings.
 
 ### R3 — `ESB_PONG_FLAG_MAG_HOLD` / `MAG_UNHOLD` (firmware task F1) — **done**
 
@@ -163,6 +184,11 @@ runtime control knob. `MAG_HOLD` is the safe equivalent. **Do not expose
 Side effect worth knowing about at the host: while held, the tracker reports mag
 disturbance continuously, so the existing temperature-byte sign-flip shows
 "disturbed" for the duration of the hold.
+
+Releasing the hold also re-baselines the tracker's rest-gated heading check
+(firmware task F2): `MAG_UNHOLD` is the host saying the field is trustworthy
+again, so the tracker latches a fresh reference at its next rest instead of
+comparing against one from before the hold.
 
 ### R4 — Carry Phase 3 actuation
 

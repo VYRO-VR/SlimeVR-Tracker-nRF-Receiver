@@ -109,6 +109,13 @@ static inline uint8_t esb_rf_channel_decode(uint8_t stored)
 #define ESB_PONG_FLAG_OTA_SUPPRESS 0x32     // Suppress tracker during OTA (reduce poll rate)
 #define ESB_PONG_FLAG_OTA_UNSUPPRESS 0x33   // Resume normal poll rate after OTA
 
+// Tracker -> host: gyro sensitivity calibration report (sens auto), standalone
+// only, never inside a composite frame. Deliberately outside the 0-7 stream
+// types SlimeVR Server parses: the server reads type 6 as button + sleep time
+// and would turn every calibration run into a burst of taps (resets). The
+// server ignores unknown types; the generic type <= 223 path forwards it.
+#define ESB_SENS_CAL_REPORT_TYPE 0x40
+
 // Raw data collection packet types
 #define ESB_RAW_IMU_TYPE 0x10      // Raw IMU data (float, with piggybacked mag)
 #define ESB_RAW_MAG_TYPE 0x11      // Raw magnetometer data (float, reserved)
