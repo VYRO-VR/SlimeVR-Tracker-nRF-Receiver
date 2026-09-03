@@ -2273,6 +2273,25 @@ void event_handler(struct esb_evt const *event)
 				}
 
 				// Forward packet for other cases (normal, potential loss, reboot)
+				if (rx_payload.data[0] == ESB_SENS_CAL_REPORT_TYPE) {
+					/* Echo the sensitivity calibration report on the console.
+					 * Preflight drives the guided calibration over the console
+					 * CDC and cannot read HID while SlimeVR Server holds it, so
+					 * this line is its only view of the tracker's phase and
+					 * verdict. The format is a host contract (see
+					 * docs/yaw-drift-requirements.md R2). Deferred logging is
+					 * safe from this context; at 2 Hz it is negligible. */
+					LOG_INF(
+						"Sens cal tracker %u: phase %u result %u axis %u seq %u scale %u progress %u",
+						tracker_id,
+						rx_payload.data[2],
+						rx_payload.data[3],
+						rx_payload.data[4],
+						rx_payload.data[5],
+						sys_get_le16(&rx_payload.data[6]),
+						sys_get_le16(&rx_payload.data[8])
+					);
+				}
 				// For status packets (type 3), fill in packet loss statistics before forwarding
 				if (rx_payload.data[0] == 3) {
 					struct packet_stats *stats = &tracker_stats[tracker_id];

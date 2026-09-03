@@ -695,8 +695,9 @@ SYS_INIT(composite_pre_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
 //|RX     3|status ("status")
 //|RX     4|full precision quat and magnetometer
 //|RX     5|runtime ("status2")
-//|RX     6|gyro sensitivity calibration progress/result (sens auto)
+//|RX     6|reduced precision quat and accel with button and sleep time ("info2")
 //|RX     7|button and sleep time ("info2")
+//|RX  0x40|gyro sensitivity calibration progress/result (sens auto)
 
 //|b0      |b1      |b2      |b3      |b4      |b5      |b6      |b7      |b8      |b9      |b10     |b11     |b12     |b13     |b14     |b15     |
 //|type    |id      |packet data                                                                                                                  |
@@ -706,16 +707,21 @@ SYS_INIT(composite_pre_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
 //|RX     3|id      |svr_stat|status  |resv----------------------------------------------------------------------------------------------|rssi    |
 //|RX     4|id      |q0               |q1               |q2               |q3               |m0               |m1               |m2               |
 //|RX     5|id      |runtime                                                                |resv----------------------------------------|rssi    |
-//|RX     6|id      |phase   |result  |axis    |seq     |scale_q12        |progress         |resv------------------------------|rssi    |
-//|RX     7|id      |button  |sleeptime        |q_buf                              |a0               |a1               |a2               |rssi    |
+//|RX     6|id      |button  |sleeptime        |q_buf                              |a0               |a1               |a2               |rssi    |
+//|RX     7|id      |button  |sleeptime        |resv----------------------------------------------------------------------------|rssi    |
+//|RX  0x40|id      |phase   |result  |axis    |seq     |scale_q12        |progress         |resv------------------------------|rssi    |
 
 // runtime is in microseconds (overkill), sleeptime is in milliseconds (overkill but less)
 
-// Type 6 is the gyro sensitivity calibration report. It replaces the legacy
-// "reduced precision quat + button/sleeptime" meaning of type 6, which this
-// tracker firmware does not send. Sent standalone only, never inside a
-// composite (0xFE) frame: an unknown sub-type inside a composite cannot be
-// skipped and would mis-offset every sub-packet after it.
+// Type 0x40 (ESB_SENS_CAL_REPORT_TYPE) is the gyro sensitivity calibration
+// report. It lives outside the 0-7 range on purpose: SlimeVR Server parses
+// type 6 as button + sleep time and sends a tap (reset) whenever the button
+// bits change, so a report on type 6 turned every calibration run into a burst
+// of resets. The server ignores stream types it does not know. Sent standalone
+// only, never inside a composite (0xFE) frame: an unknown sub-type inside a
+// composite cannot be skipped and would mis-offset every sub-packet after it.
+// The receiver forwards it to HID unchanged and echoes it on the console for
+// Preflight (see esb.c and docs/yaw-drift-requirements.md R2).
 //   phase     enum sens_cal_phase: 0 idle, 1 hold still, 2 bias, 3 armed,
 //             4 recording, 5 done (terminal, see result)
 //   result    enum sens_cal_result: 0 none (still running), 1 ok, 2 invalid
