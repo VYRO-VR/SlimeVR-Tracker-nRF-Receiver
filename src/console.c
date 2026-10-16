@@ -89,7 +89,7 @@ static const struct device *const console_uart_dev =
 	DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 static struct console_input_state console_input;
 static struct k_thread console_thread_id;
-static K_THREAD_STACK_DEFINE(console_thread_stack, 1024);
+static K_THREAD_STACK_DEFINE(console_thread_stack, 2048);
 static bool console_thread_started;
 K_MSGQ_DEFINE(console_line_msgq, sizeof(struct console_line_message),
 	      CONSOLE_LINE_QUEUE_DEPTH, 4);

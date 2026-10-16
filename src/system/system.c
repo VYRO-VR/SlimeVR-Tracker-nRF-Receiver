@@ -39,7 +39,7 @@ static int64_t last_press_duration = 0;
 bool button_held_from_init;
 static void button_thread(void);
 /* below ESB_THREAD_PRIORITY; keep equal with led/status */
-K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, BUTTON_THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(button_thread_id, 2048, button_thread, NULL, NULL, NULL, BUTTON_THREAD_PRIORITY, 0, 0);
 #else
 #define BUTTON_EXISTS false
 #pragma message "Button GPIO does not exist"
