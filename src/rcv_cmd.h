@@ -30,18 +30,25 @@ uint8_t rcv_cmd_collect_start(uint8_t tracker_id);
 uint8_t rcv_cmd_collect_stop(void);
 uint8_t rcv_cmd_collect_batch_start(uint16_t rate_hz);
 uint8_t rcv_cmd_collect_batch_stop(void);
+/* Queue selected metadata repair for one active tracker. */
+uint8_t rcv_cmd_collect_meta(uint8_t tracker_id, uint8_t mask, uint8_t chunk);
 uint8_t rcv_cmd_reboot(void);
 uint8_t rcv_cmd_dfu(bool ota);
 uint8_t rcv_cmd_tracker_channel_all(uint8_t channel);
 uint8_t rcv_cmd_tracker_channel_clear_all(void);
 
 /* Queue ESB PONG remote flag. target_id RCV_HID_TARGET_ALL = all active.
- * TEST_MODE_ON/OFF are rejected here; use the test-specific helpers below. */
+ * Channel/test flags require their typed APIs. Raw ON/OFF use collection
+ * admission; batch ON requires the rate-bearing batch API. */
 uint8_t rcv_cmd_remote_flag(uint8_t target_id, uint8_t pong_flag);
 /* Queue TEST_MODE_ON with optional target TPS (0 = tracker default). */
 uint8_t rcv_cmd_remote_test_on(uint8_t target_id, uint16_t tps);
 /* Queue TEST_MODE_OFF. */
 uint8_t rcv_cmd_remote_test_off(uint8_t target_id);
+/* Async terminal WOM query (0), set (1..35791), clear (ESB_WOM_TIMEOUT_CLEAR),
+ * or entry (ESB_WOM_ENTER). Success for entry means admission, not sleep.
+ * Shares the HID remote job; all targets uses the active-tracker scan. */
+uint8_t rcv_cmd_remote_wom_command(uint8_t target_id, uint16_t minutes);
 
 /* sens set / sens auto helpers */
 uint8_t rcv_cmd_remote_sens_set(uint8_t target_id, float x, float y, float z);
@@ -51,7 +58,8 @@ uint8_t rcv_cmd_remote_sens_auto(uint8_t target_id, uint8_t axis, uint16_t revol
  * Process one HID type-254 command (first 16 bytes). Writes 16-byte ACK into ack_out.
  * Returns true if ack_out is valid and should be sent.
  */
-bool rcv_cmd_process_hid(const uint8_t *buf, size_t len, uint8_t ack_out[RCV_HID_CMD_LEN]);
+bool rcv_cmd_process_hid(const uint8_t *buf, size_t len, uint32_t usb_generation,
+			 uint8_t ack_out[RCV_HID_CMD_LEN]);
 
 /* Async completion ACKs (e.g. tracker channel-all). Registered by HID, not console. */
 typedef void (*rcv_cmd_async_ack_fn)(const uint8_t ack[RCV_HID_CMD_LEN]);

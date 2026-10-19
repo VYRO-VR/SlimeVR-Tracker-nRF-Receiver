@@ -54,6 +54,10 @@
 #define RCV_HID_OP_NOP            220
 #define RCV_HID_OP_COLLECT_BATCH_START 221
 #define RCV_HID_OP_COLLECT_BATCH_STOP  222
+#define RCV_HID_OP_COLLECT_META        223
+#define RCV_HID_OP_TRACKER_EVENTS      224
+#define RCV_HID_OP_TRACKER_EVENT       225 /* IN only */
+#define RCV_HID_OP_TRACKER_OBSERVATION 226 /* IN only */
 
 /* HID OTA types occupy 0xF0–0xF7; never assign dongle opcodes here. */
 #define RCV_HID_OTA_TYPE_MIN 0xF0
@@ -77,6 +81,20 @@
 
 #define RCV_HID_CMD_LEN 16
 
+/* WOM request: target [4], LE16 operation [5:7] (0=query, 1..35791=minutes,
+ * ESB_WOM_TIMEOUT_CLEAR=clear saved override and restore exact firmware default,
+ * ESB_WOM_ENTER=request immediate WOM admission).
+ * ACK result: STARTED, kind [4]=1, id [5], LE16 value [6:8],
+ * LE16 errno [8:10], LE16 receiver token [10:12].
+ * Value=0 with errno=0 confirms clear; ESB_WOM_ENTER confirms entry admission,
+ * not physical sleep. Otherwise value is timeout minutes; nonzero errno is failure.
+ * ACK summary: OK/ENOENT, kind [4]=2, LE16 token [5:7],
+ * LE32 success mask [7:11], LE32 failure mask [11:15].
+ * Unused bytes are zero. All targets uses the active-tracker scan.
+ */
+#define RCV_HID_WOM_RESULT 1
+#define RCV_HID_WOM_SUMMARY 2
+
 static inline bool rcv_hid_opcode_is_tracker(uint8_t op)
 {
 	return op >= RCV_HID_OP_TRACKER_MIN && op <= RCV_HID_OP_TRACKER_MAX;
@@ -98,7 +116,7 @@ static inline bool rcv_hid_opcode_is_pong_flag(uint8_t op)
 	switch (op) {
 	case ESB_PONG_FLAG_SHUTDOWN:
 	case ESB_PONG_FLAG_CALIBRATE:
-	case ESB_PONG_FLAG_SIX_SIDE_CAL:
+	case ESB_PONG_FLAG_CALIBRATE_ACC:
 	case ESB_PONG_FLAG_MEOW:
 	case ESB_PONG_FLAG_SCAN:
 	case ESB_PONG_FLAG_MAG_CLEAR:
@@ -136,6 +154,8 @@ static inline bool rcv_hid_opcode_is_pong_flag(uint8_t op)
 	case ESB_PONG_FLAG_MAG_AUTO_OFF:
 	case ESB_PONG_FLAG_MAG_HOLD:
 	case ESB_PONG_FLAG_MAG_UNHOLD:
+	case ESB_PONG_FLAG_TCAL_HEATED_START:
+	case ESB_PONG_FLAG_WOM_CONTROL:
 	case ESB_PONG_FLAG_OTA_QUERY_INFO:
 	case ESB_PONG_FLAG_OTA_ABORT:
 	case ESB_PONG_FLAG_OTA_SUPPRESS:

@@ -1,0 +1,19 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+identifier: sk_cheesecake_recv33/nrf52833/uf2
+name: SK Cheesecake Receiver 33 UF2
+vendor: crazt
+type: mcu
+arch: arm
+ram: 128
+flash: 512
+toolchain:
+  - zephyr
+  - gnuarmemb
+  - xtools
+supported:
+  - gpio
+  - spi
+  - usb_device
+  - watchdog

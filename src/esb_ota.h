@@ -25,18 +25,11 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <esb.h>
+#include "connection/esb.h"
 
 /*
  * ESB OTA Protocol Constants (shared with tracker)
  */
-#define ESB_OTA_DATA_TYPE       0x20
-#define ESB_OTA_STATUS_TYPE     0x21
-#define ESB_OTA_FW_INFO_TYPE    0x22
-#define ESB_OTA_BEGIN_TYPE      0x23
-#define ESB_OTA_VERIFY_TYPE     0x24
-#define ESB_OTA_ACTIVATE_TYPE   0x25
-
 #define OTA_DATA_HEADER_SIZE    4
 #define OTA_DATA_MAX_PAYLOAD    60
 
@@ -101,6 +94,12 @@ bool esb_ota_relay_is_target(uint8_t tracker_id);
  * Get the number of active OTA targets.
  */
 uint8_t esb_ota_relay_get_num_targets(void);
+
+/** Return true while an OTA abort tombstone remains active for a tracker. */
+bool esb_ota_relay_abort_pending(uint8_t tracker_id);
+
+/* Thread context, before a roster slot is removed/reused. */
+void esb_ota_forget_tracker(uint8_t tracker_id);
 
 /**
  * Process a HID OUT report that may contain an OTA command.

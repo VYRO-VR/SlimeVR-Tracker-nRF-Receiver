@@ -17,11 +17,12 @@ concurrency:
 permissions: write-all
 
 env:
-  ZEPHYR_SDK_VERSION: "0.17.4"
+  ZEPHYR_SDK_VERSION: "1.0.1"
+  ZEPHYR_TOOLCHAIN_VARIANT: "zephyr/gnu"
 
 jobs:
   setup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       sdk-hash: ${{ steps.generate-vars.outputs.sdk-hash }}
       sdk-revision: ${{ steps.generate-vars.outputs.sdk-revision }}
@@ -98,7 +99,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
-          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
+          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}-${{ runner.os }}-${{ runner.arch }}-gnu-arm
 
       - name: 🪁 Install Zephyr SDK
         id: install-sdk
@@ -127,13 +128,13 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.venv
-          key: venv-bootstrap-${{ env.ZEPHYR_SDK_VERSION }}
+          key: venv-bootstrap-ubuntu-24.04-py3.12-${{ env.ZEPHYR_SDK_VERSION }}
 
       - name: 🐍 Setup Python venv + West
         id: setup-venv
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
-          python3 -m venv ~/.venv
+          python3.12 -m venv ~/.venv
           ~/.venv/bin/pip install west ninja
 
       - name: ♻️ Initialize Zephyr Workspace
@@ -153,7 +154,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.venv
-          key: venv-pip-${{ env.ZEPHYR_SDK_VERSION }}-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements*.txt', 'zephyr-workspace/nrf/scripts/requirements-build.txt', 'zephyr-workspace/bootloader/mcuboot/scripts/requirements.txt') }}
+          key: venv-pip-ubuntu-24.04-py3.12-${{ env.ZEPHYR_SDK_VERSION }}-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements*.txt', 'zephyr-workspace/nrf/scripts/requirements-build.txt', 'zephyr-workspace/bootloader/mcuboot/scripts/requirements.txt') }}
 
       - name: 🐍 Install NCS, Zephyr, and MCUboot Python Requirements
         id: install-pip
@@ -208,7 +209,11 @@ jobs:
                   {boardname: "styria_r1_uf2/nrf52840", filename: "SlimeNRF_Styria_R1_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "aerorx_r1_uf2/nrf52840", filename: "SlimeNRF_AeroRX_R1_Receiver"},
                   {boardname: "aerorx_r1_uf2/nrf52840", filename: "SlimeNRF_AeroRX_R1_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
+                  {boardname: "sk_cheesecake_recv33/nrf52833/uf2", filename: "SlimeNRF_SK_Cheesecake_RECV33_Receiver"},
+                  {boardname: "sk_cheesecake_recv33/nrf52833/uf2", filename: "SlimeNRF_SK_Cheesecake_RECV33_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "nekonya_uf2/nrf52833", filename: "SlimeNRF_NekoNya_Receiver"},
+                  {boardname: "dawnrx_2_uf2/nrf52833", filename: "SlimeNRF_Dawn_Tracker_Receiver_2"},
+                  {boardname: "dawnrx_2_uf2/nrf52833", filename: "SlimeNRF_Dawn_Tracker_Receiver_2_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "foxdongle33_uf2/nrf52833", filename: "SlimeNRF_FoxDongle33_Receiver"},
                   {boardname: "foxdongle33_uf2/nrf52833", filename: "SlimeNRF_FoxDongle33_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                   {boardname: "foxdongle_uf2/nrf52840", filename: "SlimeNRF_FoxDongle_Receiver"},
@@ -220,7 +225,7 @@ jobs:
                   {boardname: "estenova_r1_uf2/nrf52840", filename: "SlimeNRF_Estenova_Receiver"},
                   {boardname: "estenova_r1_uf2/nrf52840", filename: "SlimeNRF_Estenova_Receiver_DataCollect_CDC", with_data_collect_cdc: true},
                 ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: 💻 Checkout Repository
         uses: actions/checkout@v6
@@ -244,13 +249,14 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
-          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
+          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}-${{ runner.os }}-${{ runner.arch }}-gnu-arm
           fail-on-cache-miss: true
 
       - name: 🪁 Register Zephyr SDK
         id: register-sdk
         run: |
           ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}/setup.sh -c -t arm-zephyr-eabi
+          echo "ZEPHYR_SDK_INSTALL_DIR=$HOME/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}" >> "$GITHUB_ENV"
 
       - name: 📦 Restore West Workspace
         id: restore-west
@@ -272,7 +278,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ~/.venv
-          key: venv-pip-${{ env.ZEPHYR_SDK_VERSION }}-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements*.txt', 'zephyr-workspace/nrf/scripts/requirements-build.txt', 'zephyr-workspace/bootloader/mcuboot/scripts/requirements.txt') }}
+          key: venv-pip-ubuntu-24.04-py3.12-${{ env.ZEPHYR_SDK_VERSION }}-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements*.txt', 'zephyr-workspace/nrf/scripts/requirements-build.txt', 'zephyr-workspace/bootloader/mcuboot/scripts/requirements.txt') }}
           fail-on-cache-miss: true
 
       - name: ♻️ Register Zephyr Workspace
@@ -315,7 +321,6 @@ jobs:
               --pristine=always "$REPO_DIR" \
               --build-dir "$REPO_DIR/build" \
               -- \
-              -DNCS_TOOLCHAIN_VERSION=NONE \
               -DBOARD_ROOT=../"$REPO_DIR" \
               "${EXTRA_CMAKE_ARGS[@]}"
 

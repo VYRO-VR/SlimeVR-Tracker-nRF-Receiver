@@ -52,14 +52,15 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		printk("Examples:\n");
 		printk("  send 0 shutdown      - Shutdown tracker 0\n");
 		printk("  send all shutdown    - Shutdown all active trackers\n");
-		printk("  send 1 calibrate     - Calibrate tracker 1\n");
+		printk("  send 1 calibrate     - Zero-bias calibration on tracker 1\n");
+		printk("  send 1 calibrate acc - Accelerometer calibration (18 orientations)\n");
 		printk("  send all meow        - Make all active trackers meow\n");
 		printk("  send 2 reboot        - Reboot tracker 2\n");
 		printk("  send 3 clear         - Clear pairing on tracker 3\n");
 		printk("  send all dfu         - Enter DFU mode on all active trackers\n");
 		printk(
-			"Available commands: shutdown, calibrate, 6-side, meow, scan, mag, reboot, clear, dfu, sens, "
-			"reset, ping, tcal, tdma, test\n"
+			"Available commands: shutdown, calibrate [acc], meow, scan, mag, reboot, clear, dfu, sens, "
+			"reset, ping, tcal, tdma, test, wom enter, wom timeout [minutes]\n"
 		);
 		return;
 	}
@@ -78,6 +79,44 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		tracker_id = (uint8_t)id;
 	}
 
+	if (strcmp(arg2, "wom") == 0) {
+		bool enter = arg3 && strcmp(arg3, "enter") == 0;
+		if (!arg3 || (!enter && strcmp(arg3, "timeout") != 0) ||
+		    arg5 || (enter && arg4)) {
+			printk("Usage: send <id|all> wom enter | wom timeout [minutes: 0-35791; 0 restores firmware default]\n");
+			return;
+		}
+		uint32_t minutes = enter ? ESB_WOM_ENTER : 0;
+		if (arg4) {
+			if (!*arg4) {
+				printk("Minutes must be an integer from 0 to 35791 (0 restores firmware default)\n");
+				return;
+			}
+			for (const char *p = arg4; *p; p++) {
+				if (*p < '0' || *p > '9' || minutes > 35791) {
+					printk("Minutes must be an integer from 0 to 35791 (0 restores firmware default)\n");
+					return;
+				}
+				minutes = minutes * 10 + (uint32_t)(*p - '0');
+			}
+			if (minutes > 35791) {
+				printk("Minutes must be an integer from 0 to 35791 (0 restores firmware default)\n");
+				return;
+			}
+			if (minutes == 0) {
+				minutes = ESB_WOM_TIMEOUT_CLEAR;
+			}
+		}
+		uint8_t st = rcv_cmd_remote_wom_command(
+			target_all ? RCV_HID_TARGET_ALL : tracker_id, (uint16_t)minutes);
+		if (st == RCV_HID_ST_STARTED) {
+			printk("WOM command queued; waiting for tracker results (entry success means accepted, not asleep)\n");
+		} else {
+			printk("WOM command request failed: status %u\n", st);
+		}
+		return;
+	}
+
 	uint8_t cmd_flag = 0xFF;
 	const char *cmd_name = NULL;
 
@@ -85,11 +124,20 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		cmd_flag = ESB_PONG_FLAG_SHUTDOWN;
 		cmd_name = "Shutdown";
 	} else if (strcmp(arg2, "calibrate") == 0) {
-		cmd_flag = ESB_PONG_FLAG_CALIBRATE;
-		cmd_name = "Calibrate";
+		if (arg4 || arg5 || (arg3 && strcmp(arg3, "acc") != 0)) {
+			printk("Usage: send <id|all> calibrate [acc]\n");
+			return;
+		}
+		cmd_flag = arg3 ? ESB_PONG_FLAG_CALIBRATE_ACC : ESB_PONG_FLAG_CALIBRATE;
+		cmd_name = arg3 ? "Accelerometer calibration (18 orientations)" : "Zero-bias calibration";
 	} else if (strcmp(arg2, "6-side") == 0) {
-		cmd_flag = ESB_PONG_FLAG_SIX_SIDE_CAL;
-		cmd_name = "6-side calibration";
+		if (arg3 || arg4 || arg5) {
+			printk("Usage: send <id|all> calibrate acc\n");
+			return;
+		}
+		printk("'6-side' is the historical name; use 'calibrate acc' (18 orientations).\n");
+		cmd_flag = ESB_PONG_FLAG_CALIBRATE_ACC;
+		cmd_name = "Accelerometer calibration (18 orientations)";
 	} else if (strcmp(arg2, "meow") == 0) {
 		cmd_flag = ESB_PONG_FLAG_MEOW;
 		cmd_name = "Meow";
@@ -389,7 +437,7 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 		return;
 	} else if (strcmp(arg2, "tcal") == 0) {
 		if (!arg3) {
-			printk("Usage: send <id|all> tcal <on|off|auto on|auto off|boot on|boot off|clear>\n");
+			printk("Usage: send <id|all> tcal <on|off|auto on|auto off|boot on|boot off|clear|heat start>\n");
 			printk("Example: send 0 tcal on       - Enable temperature calibration on tracker 0\n");
 			printk(
 				"Example: send all tcal off    - Disable temperature calibration on all active trackers\n"
@@ -398,10 +446,18 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 			printk("Example: send all tcal auto off - Disable auto-calibration on all active trackers\n");
 			printk("Example: send 0 tcal boot on - Enable boot calibration on tracker 0\n");
 			printk("Example: send 0 tcal clear - Clear temperature calibration on tracker 0\n");
+			printk("Example: send 0 tcal heat start - Request heated calibration at the tracker default target\n");
+			printk("Heated-start ACK confirms delivery only, not heating acceptance.\n");
 			return;
 		}
 
-		if (strcmp(arg3, "on") == 0) {
+		if (strcmp(arg3, "heat") == 0) {
+			if (!arg4 || strcmp(arg4, "start") != 0 || arg5) {
+				printk("Usage: send <id|all> tcal heat start (no target argument)\n");
+				return;
+			}
+			console_send_flag(target_all, tracker_id, ESB_PONG_FLAG_TCAL_HEATED_START, "Heated T-Cal start");
+		} else if (strcmp(arg3, "on") == 0) {
 			console_send_flag(target_all, tracker_id, ESB_PONG_FLAG_TCAL_ON, "T-Cal enable");
 		} else if (strcmp(arg3, "off") == 0) {
 			console_send_flag(target_all, tracker_id, ESB_PONG_FLAG_TCAL_OFF, "T-Cal disable");
@@ -450,7 +506,7 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 
 			console_send_flag(target_all, tracker_id, tcal_cmd, tcal_name);
 		} else {
-			printk("Unknown tcal subcommand: %s (use 'on', 'off', 'auto', 'boot' or 'clear')\n", arg3);
+			printk("Unknown tcal subcommand: %s (use 'on', 'off', 'auto', 'boot', 'clear' or 'heat start')\n", arg3);
 		}
 		return;
 	} else if (strcmp(arg2, "tdma") == 0) {
@@ -537,7 +593,7 @@ void console_handle_send(char *arg, char *arg2, char *arg3, char *arg4, char *ar
 	} else {
 		printk("Unknown command: %s\n", arg2);
 		printk(
-			"Available commands: shutdown, calibrate, 6-side, meow, scan, mag, reboot, clear, dfu [ota], "
+			"Available commands: shutdown, calibrate [acc], meow, scan, mag, reboot, clear, dfu [ota], "
 			"fusion, sens, "
 			"reset, ping, tcal, tdma, test\n"
 		);

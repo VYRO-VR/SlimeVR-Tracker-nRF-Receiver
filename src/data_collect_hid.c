@@ -36,8 +36,8 @@
 
 #include "data_collect.h"
 #include "connection/esb.h"
-
-#include <stddef.h>
+#include "globals.h"
+#include <zephyr/irq.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -86,6 +86,8 @@ static struct k_work dc_send_work;
 /* Runtime state */
 static bool dc_active;
 static uint8_t dc_target_tracker_id;
+static bool dc_batch_active;
+static uint32_t dc_batch_mask;
 static uint32_t dc_frames_sent;
 static uint32_t dc_frames_dropped;
 static uint32_t dc_frames_received; /* Total raw packets from ESB (before dedup) */
@@ -225,7 +227,26 @@ static const struct hid_device_ops dc_hid_ops = {
 static void dc_timeout_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	if (!dc_active) return;
+	if (!dc_active && !dc_batch_active) {
+		return;
+	}
+
+	if (dc_batch_active) {
+		uint32_t mask = dc_batch_mask;
+		data_collect_batch_stop();
+		for (uint8_t tid = 0; tid < MAX_TRACKERS; tid++) {
+			if (mask & BIT(tid)) {
+				esb_send_remote_command(tid, ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF);
+			}
+		}
+		LOG_WRN(
+			"Batch data collection timed out (no data for %d s), sent OFF to trackers 0x%08x",
+			DC_TIMEOUT_MS / 1000,
+			(unsigned int)mask
+		);
+		return;
+	}
+
 	uint8_t tid = dc_target_tracker_id;
 	data_collect_stop();
 	esb_send_remote_command(tid, ESB_PONG_FLAG_DATA_COLLECT_OFF);
@@ -240,7 +261,7 @@ static void dc_timeout_timer_handler(struct k_timer *timer)
 	ARG_UNUSED(timer);
 	int64_t now = k_uptime_get();
 
-	if (dc_active && now - dc_last_stats_time >= DC_STATS_INTERVAL_MS) {
+	if ((dc_active || dc_batch_active) && now - dc_last_stats_time >= DC_STATS_INTERVAL_MS) {
 		uint32_t period_sent = dc_frames_sent - dc_last_stats_sent;
 		uint32_t period_dropped = dc_frames_dropped - dc_last_stats_dropped;
 		uint32_t period_received = dc_frames_received - dc_last_stats_received;
@@ -254,8 +275,7 @@ static void dc_timeout_timer_handler(struct k_timer *timer)
 		dc_last_stats_received = dc_frames_received;
 	}
 
-	if (dc_active && dc_last_rx_time > 0 &&
-	    (now - dc_last_rx_time) > DC_TIMEOUT_MS) {
+	if ((dc_active || dc_batch_active) && dc_last_rx_time > 0 && (now - dc_last_rx_time) > DC_TIMEOUT_MS) {
 		k_work_submit(&dc_timeout_work);
 	}
 }
@@ -282,8 +302,16 @@ int data_collect_init(void)
 	}
 
 	dc_active = false;
+	dc_batch_active = false;
+	dc_batch_mask = 0;
 	dc_frames_sent = 0;
 	dc_frames_dropped = 0;
+	dc_frames_received = 0;
+	dc_last_rx_time = 0;
+	dc_last_stats_time = k_uptime_get();
+	dc_last_stats_sent = 0;
+	dc_last_stats_dropped = 0;
+	dc_last_stats_received = 0;
 
 	LOG_INF("Data collection HID endpoint initialized");
 	return 0;
@@ -293,7 +321,9 @@ SYS_INIT(data_collect_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
 
 void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 {
-	if (!dc_hdev || !dc_active) return;
+	if (!dc_hdev || (!dc_active && !dc_batch_active)) {
+		return;
+	}
 
 	dc_last_rx_time = k_uptime_get();
 	dc_frames_received++;
@@ -332,9 +362,29 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi)
 	k_work_submit(&dc_send_work);
 }
 
+static void dc_reset_fifo_locked(void)
+{
+	/* Producers are stopped by the caller while this queue ownership changes.
+	 * If a report is in flight, it is always the current read slot: the send
+	 * work sets dc_submitted_report from dc_fifo[dc_fifo_read], and completion
+	 * advances that same slot only after pointer validation. */
+	if (dc_submitted_report != NULL) {
+		size_t inflight = (size_t)atomic_get(&dc_fifo_read);
+		/* Keep only the in-flight slot; discard all queued old reports. */
+		atomic_set(&dc_fifo_write, (atomic_val_t)dc_fifo_next(inflight));
+	} else {
+		atomic_set(&dc_fifo_read, atomic_get(&dc_fifo_write));
+	}
+}
 void data_collect_start(uint8_t tracker_id)
 {
+	unsigned int key = irq_lock();
+	dc_active = false;
+	dc_batch_active = false;
+	dc_batch_mask = 0;
 	dc_target_tracker_id = tracker_id;
+	dc_reset_fifo_locked();
+	/* Publish new mode only after old queue is no longer writable. */
 	dc_active = true;
 	dc_frames_sent = 0;
 	dc_frames_dropped = 0;
@@ -344,39 +394,35 @@ void data_collect_start(uint8_t tracker_id)
 	dc_last_stats_dropped = 0;
 	dc_last_stats_received = 0;
 	dc_last_rx_time = k_uptime_get();
-
-	/* Wait briefly for in-flight USB report before resetting FIFO.
-	 * Clearing indices/busy while submit is outstanding lets done_cb
-	 * advance a rewound read pointer and corrupt the ring. */
-	bool idle = false;
-	for (int i = 0; i < 20; i++) {
-		if (dc_submitted_report == NULL &&
-		    !atomic_test_bit(dc_ep_busy, DC_EP_BUSY_FLAG)) {
-			idle = true;
-			break;
-		}
-		k_msleep(1);
-	}
-
-	if (idle) {
-		atomic_set(&dc_fifo_write, 0);
-		atomic_set(&dc_fifo_read, 0);
-		dc_submitted_report = NULL;
-		atomic_clear_bit(dc_ep_busy, DC_EP_BUSY_FLAG);
-		if (dc_hid_ready) {
-			k_work_submit(&dc_send_work);
-		}
-	} else {
-		LOG_WRN("Data collect start: endpoint busy, keeping FIFO");
-	}
+	irq_unlock(key);
 	LOG_INF("Data collection STARTED for tracker %u (HID)", tracker_id);
 }
 
 void data_collect_stop(void)
 {
+	unsigned int key = irq_lock();
 	dc_active = false;
+	dc_reset_fifo_locked();
+	irq_unlock(key);
 	LOG_INF("Data collection STOPPED (received: %u, sent: %u, dropped: %u)",
 		dc_frames_received, dc_frames_sent, dc_frames_dropped);
+}
+
+void data_collect_forget_tracker(uint8_t tracker_id)
+{
+	if (tracker_id >= MAX_TRACKERS) {
+		return;
+	}
+	unsigned int key = irq_lock();
+	if (dc_target_tracker_id == tracker_id) {
+		dc_active = false;
+		dc_target_tracker_id = UINT8_MAX;
+	}
+	dc_batch_mask &= ~BIT(tracker_id);
+	dc_batch_active = dc_batch_mask != 0;
+	/* Preserve USB ownership of an in-flight report, discard queued frames. */
+	dc_reset_fifo_locked();
+	irq_unlock(key);
 }
 
 bool data_collect_is_active(void)
@@ -387,6 +433,53 @@ bool data_collect_is_active(void)
 uint8_t data_collect_get_target_id(void)
 {
 	return dc_target_tracker_id;
+}
+
+void data_collect_batch_start(uint32_t mask, uint16_t rate_hz)
+{
+	unsigned int key = irq_lock();
+	dc_active = false;
+	dc_batch_active = false;
+	dc_batch_mask = 0;
+	dc_reset_fifo_locked();
+	/* Publish new mode only after old queue is no longer writable. */
+	dc_batch_mask = mask;
+	dc_batch_active = mask != 0U;
+	dc_frames_sent = 0;
+	dc_frames_dropped = 0;
+	dc_frames_received = 0;
+	dc_last_stats_time = k_uptime_get();
+	dc_last_stats_sent = 0;
+	dc_last_stats_dropped = 0;
+	dc_last_stats_received = 0;
+	dc_last_rx_time = k_uptime_get();
+	irq_unlock(key);
+	LOG_INF("Batch data collection STARTED mask=0x%08x rate=%u Hz", (unsigned int)mask, rate_hz);
+}
+
+void data_collect_batch_stop(void)
+{
+	unsigned int key = irq_lock();
+	dc_batch_active = false;
+	dc_batch_mask = 0;
+	dc_reset_fifo_locked();
+	irq_unlock(key);
+	LOG_INF(
+		"Batch data collection STOPPED (received: %u, sent: %u, dropped: %u)",
+		dc_frames_received,
+		dc_frames_sent,
+		dc_frames_dropped
+	);
+}
+
+bool data_collect_batch_is_active(void)
+{
+	return dc_batch_active;
+}
+
+bool data_collect_batch_is_target(uint8_t tracker_id)
+{
+	return dc_batch_active && tracker_id < MAX_TRACKERS && (dc_batch_mask & BIT(tracker_id)) != 0U;
 }
 
 bool data_collect_is_target(uint8_t tracker_id)

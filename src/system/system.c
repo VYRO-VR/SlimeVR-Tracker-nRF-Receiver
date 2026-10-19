@@ -9,11 +9,13 @@
 #include <zephyr/sys/reboot.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/storage/flash_map.h>
-#include <zephyr/fs/nvs.h>
+#include <zephyr/kvss/nvs.h>
 #include <hal/nrf_gpio.h>
 #include <hal/nrf_power.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/fatal.h>
+#include <zephyr/logging/log_ctrl.h>
 #if defined(CONFIG_BOOTLOADER_MCUBOOT)
 #include <zephyr/retention/bootmode.h>
 #endif
@@ -23,8 +25,8 @@
 static struct nvs_fs fs;
 
 #define NVS_PARTITION storage_partition
-#define NVS_PARTITION_DEVICE FIXED_PARTITION_DEVICE(NVS_PARTITION)
-#define NVS_PARTITION_OFFSET FIXED_PARTITION_OFFSET(NVS_PARTITION)
+#define NVS_PARTITION_DEVICE PARTITION_DEVICE(NVS_PARTITION)
+#define NVS_PARTITION_OFFSET PARTITION_OFFSET(NVS_PARTITION)
 
 LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
 
@@ -37,7 +39,7 @@ static int64_t last_press_duration = 0;
 bool button_held_from_init;
 static void button_thread(void);
 /* below ESB_THREAD_PRIORITY; keep equal with led/status */
-K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, BUTTON_THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(button_thread_id, 2048, button_thread, NULL, NULL, NULL, BUTTON_THREAD_PRIORITY, 0, 0);
 #else
 #define BUTTON_EXISTS false
 #pragma message "Button GPIO does not exist"
@@ -48,11 +50,83 @@ K_THREAD_DEFINE(button_thread_id, 1024, button_thread, NULL, NULL, NULL, BUTTON_
 #define ADAFRUIT_DFU_MAGIC_UF2_RESET 0x57
 #define ADAFRUIT_DFU_MAGIC_OTA_RESET 0xA8
 #define ADAFRUIT_DFU_MAGIC_SKIP 0x6D
+#define ADAFRUIT_RECOVERY_WDT_FIRST 0xE1
+#define ADAFRUIT_RECOVERY_WDT_SECOND 0xE2
+#define ADAFRUIT_RECOVERY_FATAL 0xE3
+#define ADAFRUIT_RECOVERY_CAPABILITY 0x52435631u
+#define ADAFRUIT_RECOVERY_ENABLED (CONFIG_SOC_SERIES_NRF52 && CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT)
+
+static uint32_t boot_reset_reason;
+#if ADAFRUIT_RECOVERY_ENABLED
+/* Captured before ESB reuses TIMER2; false also covers pre-init fatal errors. */
+static bool bootloader_supports_recovery;
+#endif
+extern void sys_arch_reboot(int type);
+
+static int sys_reset_reason_init(void)
+{
+#if ADAFRUIT_RECOVERY_ENABLED
+	bootloader_supports_recovery =
+		NRF_TIMER2->CC[1] == ADAFRUIT_RECOVERY_CAPABILITY;
+	NRF_TIMER2->CC[1] = 0;
+#endif
+#ifdef NRF_RESET
+	boot_reset_reason = NRF_RESET->RESETREAS;
+	NRF_RESET->RESETREAS = boot_reset_reason;
+#else
+	boot_reset_reason = NRF_POWER->RESETREAS;
+	NRF_POWER->RESETREAS = boot_reset_reason;
+#if ADAFRUIT_RECOVERY_ENABLED
+	if (bootloader_supports_recovery &&
+	    (NRF_POWER->GPREGRET == ADAFRUIT_RECOVERY_WDT_FIRST ||
+	     NRF_POWER->GPREGRET == ADAFRUIT_RECOVERY_WDT_SECOND)) {
+		/* The paired bootloader has already consumed the hardware DOG bit. */
+		boot_reset_reason |= POWER_RESETREAS_DOG_Msk;
+	}
+#endif
+#endif
+	return 0;
+}
+
+SYS_INIT(sys_reset_reason_init, PRE_KERNEL_1, 0);
+
+void sys_mark_boot_success(void)
+{
+#if ADAFRUIT_RECOVERY_ENABLED
+	if (!bootloader_supports_recovery) {
+		return;
+	}
+	unsigned int key = irq_lock();
+	if (NRF_POWER->GPREGRET == ADAFRUIT_RECOVERY_WDT_FIRST ||
+	    NRF_POWER->GPREGRET == ADAFRUIT_RECOVERY_WDT_SECOND) {
+		NRF_POWER->GPREGRET = 0;
+	}
+	irq_unlock(key);
+#endif
+}
+
+void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
+{
+	ARG_UNUSED(reason);
+	ARG_UNUSED(esf);
+#if ADAFRUIT_RECOVERY_ENABLED
+	NRF_POWER->GPREGRET = bootloader_supports_recovery ?
+		ADAFRUIT_RECOVERY_FATAL : ADAFRUIT_DFU_MAGIC_UF2_RESET;
+	__DSB();
+#else
+	LOG_PANIC();
+	LOG_ERR("Resetting system");
+#endif
+	sys_arch_reboot(SYS_REBOOT_COLD);
+	CODE_UNREACHABLE;
+}
 
 void sys_skip_dfu_marker(void)
 {
 #if DFU_EXISTS && !CONFIG_BOOTLOADER_MCUBOOT
-	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP; // Skip DFU
+	if (NRF_POWER->GPREGRET == 0) {
+		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP;
+	}
 #endif
 }
 
@@ -150,9 +224,9 @@ static struct gpio_callback button_cb_data;
 static int sys_button_init(void)
 {
 #ifdef NRF_RESET
-	bool reset_vbus_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_VBUS_Msk;
+	bool reset_vbus_reset = boot_reset_reason & RESET_RESETREAS_VBUS_Msk;
 #else
-	bool reset_vbus_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_VBUS_Msk;
+	bool reset_vbus_reset = boot_reset_reason & POWER_RESETREAS_VBUS_Msk;
 #endif
 	gpio_pin_configure_dt(&button0, GPIO_INPUT);
 	gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_BOTH);
@@ -197,6 +271,11 @@ void sys_request_system_off(void)
 void sys_request_system_reboot(void)
 {
 	LOG_INF("System reboot requested");
+	/* LED strips latch their last frame and the bootloader does not drive them,
+	 * so clear the indicator before leaving the application (UF2/DFU entries
+	 * would otherwise keep the last pattern color lit).
+	 */
+	set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
 	sys_reboot(SYS_REBOOT_COLD);
 }
 
@@ -269,8 +348,11 @@ static void button_thread(void)
 			if (press_duration >= 5000 && press_duration < 10000 && !long_press_5s_triggered)
 			{
 				LOG_INF("Clear all pairings requested (5s) - triggered on release");
-				esb_clear();
-				set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_HIGHEST);
+				if (esb_clear() == 0) {
+					set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_HIGHEST);
+				} else {
+					LOG_ERR("Pairings were not cleared");
+				}
 				long_press_5s_triggered = true;
 				// Reset counters
 				num_presses = 0;
@@ -345,20 +427,35 @@ void reboot_counter_write(uint8_t reboot_counter) {
 }
 
 // retained not implemented
-void sys_write(uint16_t id, void* retained_ptr, const void* data, size_t len) {
-	sys_nvs_init();
-	int err = nvs_write(&fs, id, data, len);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to write to NVS, error: %d", err);
-		return;
+int sys_write_checked(uint16_t id, const void *data, size_t len)
+{
+	if (sys_nvs_init()) {
+		return -EIO;
 	}
+	int err = nvs_write(&fs, id, data, len);
+	if (err < 0) {
+		LOG_ERR("Failed to write to NVS, error: %d", err);
+		return err;
+	}
+	return 0;
+}
+
+void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
+{
+	(void)sys_write_checked(id, data, len);
+}
+
+int sys_read_checked(uint16_t id, void *data, size_t len)
+{
+	if (sys_nvs_init()) {
+		return -EIO;
+	}
+	return nvs_read(&fs, id, data, len);
 }
 
 // reading from nvs
 void sys_read(uint16_t id, void* data, size_t len) {
-	sys_nvs_init();
-	int err = nvs_read(&fs, id, data, len);
+	int err = sys_read_checked(id, data, len);
 	if (err < 0)
 	{
 		if (err == -ENOENT) // suppress ENOENT

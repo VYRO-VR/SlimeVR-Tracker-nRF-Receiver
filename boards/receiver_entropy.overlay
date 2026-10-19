@@ -1,0 +1,11 @@
+/* ENTROPY_GENERATOR also enables Zephyr's chosen-device random backend.
+ * nRF52833/840 receivers use their RNG, not disabled CryptoCell. */
+/ {
+	chosen {
+		zephyr,entropy = &rng;
+	};
+};
+
+&rng {
+	status = "okay";
+};
