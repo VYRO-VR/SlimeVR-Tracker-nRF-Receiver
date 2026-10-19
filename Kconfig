@@ -66,6 +66,33 @@ config RADIO_RF_CHANNEL
         Radio RF channel (0-100).
         Must match the receiver channel.
 
+config RADIO_AUTO_CHANNEL
+    bool "Loss-triggered runtime receiver channel avoidance"
+    default y
+    select ENTROPY_GENERATOR
+    help
+        Compile automatic avoidance support; runtime starts disabled on every
+        boot. Explicit channelauto on enables it until reboot.
+        Exchange short no-ACK identity beacons on the working channel
+        every 2-4 seconds. A full 10-second normal sequence-loss window
+        with at least 100 inferred frames and strictly more than 20% loss starts
+        a distributed energy survey and finalist confirmation. Choose only
+        even channels 0-88 with strictly quieter accepted peak energy than
+        HOME; ties and incomplete coverage do not move. Matched paired-address
+        activity rejects a visit. Known peer channels are excluded; HOME-only
+        beacons do not negotiate destinations or prove other channels vacant.
+        No observed peer is required for one trial migration. After a
+        successful move and original-roster recovery, a fresh window on a
+        stable receiver layout with persistent >20% loss stops automatic
+        radio actions and suggests possible host USB/RF
+        interference: use an extension cable and move away from the host.
+        Explicit channelauto on or reboot clears the persistent-loss stop;
+        reboot leaves avoidance disabled.
+        Manual settings retain range 0-100; candidate channel 90 is excluded.
+        Defers during pairing, OTA, raw capture and channel operations.
+        Test-all suspends loss scans; working-channel beacons continue.
+        A manual override disables avoidance until explicit channelauto on.
+
 config RADIO_RETRANSMIT_DELAY
     int "Radio retransmit delay (µs)"
     default 600

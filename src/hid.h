@@ -23,9 +23,12 @@
 #ifndef SLIMENRF_HID
 #define SLIMENRF_HID
 
+#include <stdbool.h>
 #include <stdint.h>
 
 void hid_write_packet_n(const uint8_t *data, uint8_t rssi);
+/* Nonzero subscription generation; false means the FIFO did not accept it. */
+bool hid_write_tracker_event(const uint8_t record[16], uint32_t generation);
 uint32_t hid_get_current_tps(void);
 uint32_t hid_get_total_drop_count(void);
 uint32_t hid_get_total_tracker_drop_count(uint8_t tracker_id);

@@ -150,8 +150,8 @@ not know, so the report now sits outside its 0–7 range. The legacy type 6 and
 
 | Flag | Value |
 |---|---|
-| `ESB_PONG_FLAG_MAG_HOLD` | `0x27` |
-| `ESB_PONG_FLAG_MAG_UNHOLD` | `0x28` |
+| `ESB_PONG_FLAG_MAG_HOLD` | `0x38` |
+| `ESB_PONG_FLAG_MAG_UNHOLD` | `0x39` |
 
 Neither carries PONG payload bytes — `data[3..11]` are untouched, so the normal
 time-sync path applies. Both sit outside `0x30`–`0x33` (the OTA range the
@@ -165,7 +165,7 @@ Plumbed the usual way:
 - names in `esb_pong_flag_name` (`src/connection/esb.c`)
 - allowlisted in `rcv_hid_opcode_is_pong_flag` (`src/rcv_hid_cmd.h`), which
   gates **both** the HID path and the console path, so the HID opcode is the
-  flag value itself (`0x27` / `0x28`)
+  flag value itself (`0x38` / `0x39`)
 - console verb `send <id|all> mag hold <on|off>` (`src/console_send.c`)
 
 On the tracker the flag makes the fusion backend skip the magnetometer update

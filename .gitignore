@@ -7,6 +7,15 @@
 .cache
 compile_commands.json
 
+# Host harness build intermediates; runners otherwise use temporary directories
+/tests/host/**/*.o
+/tests/host/**/*.so
+/tests/host/**/.generated/
+/tests/host/**/.generated.stamp
+
 # python-generated files
 __pycache__/
 *.py[oc]
+
+# Local tracker event captures
+tracker-events-*.jsonl

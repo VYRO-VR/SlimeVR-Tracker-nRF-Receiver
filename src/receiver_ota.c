@@ -10,19 +10,21 @@
 
 #include "receiver_ota.h"
 #include "esb_ota.h"
+#include "connection/esb.h"
 #include "hid.h"
 #include "build_defines.h"
 #include "thread_priority.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/flash.h>
+#include <zephyr/storage/flash_map.h>
 #include <zephyr/sys/crc.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/logging/log.h>
 #if defined(CONFIG_BOOTLOADER_MCUBOOT) && DT_NODE_EXISTS(DT_NODELABEL(slot1_partition))
 #include <zephyr/dfu/mcuboot.h>
-#include <zephyr/storage/flash_map.h>
 #define RCV_OTA_USE_MCUBOOT 1
 #else
 #define RCV_OTA_USE_MCUBOOT 0
@@ -34,17 +36,13 @@ LOG_MODULE_REGISTER(receiver_ota, LOG_LEVEL_INF);
 
 /* ── Flash configuration ─────────────────────────────────────────── */
 
-#ifndef CONFIG_FLASH_LOAD_OFFSET
-#define CONFIG_FLASH_LOAD_OFFSET 0x1000
-#endif
-
 /* MBR occupies 0x0-0x1000 and must not be overwritten via OTA */
-#define RCV_OTA_FLASH_BASE      MAX(CONFIG_FLASH_LOAD_OFFSET, 0x1000)
+#define RCV_OTA_FLASH_BASE      MAX(PARTITION_NODE_OFFSET(DT_CHOSEN(zephyr_code_partition)), 0x1000)
 #define RCV_OTA_FLASH_PAGE_SIZE  4096
 
 /*
  * App partition end address (before NVS storage).
- * These match the fixed-partition layouts.
+ * These preserve the existing partition layout limits.
  */
 #if defined(CONFIG_BOOTLOADER_MCUBOOT)
 #define RCV_OTA_FLASH_END        0
@@ -112,8 +110,11 @@ static struct k_sem *slot_sems[2] = { &slot_sem_0, &slot_sem_1 };
 
 K_MSGQ_DEFINE(page_write_msgq, sizeof(uint8_t), 4, 1);
 
-static volatile bool writer_error;
-static volatile bool writer_running;
+static atomic_t writer_error;
+static atomic_t writer_stop_requested;
+/* HID command thread owns this flag. It remains set after natural exit or a
+ * stop timeout, until join proves the thread and stack can be reused. */
+static bool writer_created;
 
 /* ── Bootloader settings (Adafruit UF2 bootloader) ───────────────── */
 
@@ -131,20 +132,6 @@ struct bootloader_settings {
 	uint32_t app_image_size;
 	uint32_t sd_image_start;
 } __attribute__((packed));
-
-/* ── CRC helpers ─────────────────────────────────────────────────── */
-
-static inline uint8_t rcv_ota_crc8(const uint8_t *data, size_t len)
-{
-	uint8_t crc = 0;
-	for (size_t i = 0; i < len; i++) {
-		crc ^= data[i];
-		for (int j = 0; j < 8; j++) {
-			crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) : (crc << 1);
-		}
-	}
-	return crc;
-}
 
 /* ── OTA State ───────────────────────────────────────────────────── */
 
@@ -198,7 +185,7 @@ static void rcv_ota_handle_activate(void);
 static void rcv_ota_handle_abort(void);
 static int  rcv_ota_flush_page_buf(void);
 static void rcv_ota_start_writer(void);
-static void rcv_ota_stop_writer(void);
+static int rcv_ota_stop_writer(void);
 static void rcv_ota_do_verify(void);
 static void rcv_ota_do_activate(void);
 static void rcv_ota_activate_and_reset(void);
@@ -227,13 +214,33 @@ void receiver_ota_process_hid(const uint8_t *data, size_t len)
 		}
 	}
 
+	/* A timed-out stop still owns the old session. Only retirement retries
+	 * and read-only queries are allowed until the writer has been joined. */
+	if (atomic_get(&writer_stop_requested) &&
+	    report_type != HID_OTA_BEGIN && report_type != HID_OTA_ABORT &&
+	    report_type != HID_OTA_QUERY_INFO) {
+		rcv_ota_send_status();
+		return;
+	}
+
 	switch (report_type) {
 	case HID_OTA_QUERY_INFO:
 		rcv_ota_send_fw_info();
 		break;
-	case HID_OTA_BEGIN:
+	case HID_OTA_BEGIN: {
+		bool acquired_radio = !receiver_ota_is_active();
+		if (acquired_radio && esb_radio_operation_begin()) {
+			LOG_WRN("Receiver OTA BEGIN deferred: radio operation busy");
+			rcv_ota_send_status();
+			break;
+		}
+		esb_auto_loss_invalidate();
 		rcv_ota_handle_begin(data, len);
+		if (acquired_radio) {
+			esb_radio_operation_end();
+		}
 		break;
+	}
 	case HID_OTA_DATA:
 		rcv_ota_handle_data(data, len);
 		break;
@@ -301,7 +308,7 @@ static void rcv_ota_send_fw_info(void)
 	sys_put_be16((uint16_t)((RCV_OTA_USE_MCUBOOT ? 0 : RCV_OTA_FLASH_BASE) >> 12),
 		     &info[63]);
 
-	info[65] = rcv_ota_crc8(info, 65);
+	info[65] = crc8_ccitt(0, info, 65);
 
 	/* Send as 6 chunked HID sub-reports (same as tracker FW_INFO relay) */
 	for (int chunk = 0; chunk < 6; chunk++) {
@@ -337,6 +344,10 @@ static void rcv_ota_send_status(void)
 	default:                 status_code = OTA_STATUS_ERROR; break;
 	}
 
+	if (atomic_get(&writer_stop_requested)) {
+		status_code = OTA_STATUS_TIMEOUT;
+	}
+
 	uint8_t hid_report[16] = {0};
 	hid_report[0] = HID_OTA_STATUS;
 	hid_report[1] = RECEIVER_OTA_ID;
@@ -346,7 +357,9 @@ static void rcv_ota_send_status(void)
 	/* hid_report[9] = ring_count (0 for receiver self-OTA, no ring buffer) */
 
 	hid_write_packet_n(hid_report, 0);
-	rcv_ota.last_status_time = k_uptime_get();
+	if (!atomic_get(&writer_stop_requested)) {
+		rcv_ota.last_status_time = k_uptime_get();
+	}
 }
 
 /* ── BEGIN ────────────────────────────────────────────────────────── */
@@ -379,8 +392,15 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 
 	/* Reject duplicate if already in progress */
 	if (rcv_ota.state != RCV_OTA_IDLE && rcv_ota.state != RCV_OTA_ERROR &&
-	    rcv_ota.state != RCV_OTA_COMPLETE) {
+	    rcv_ota.state != RCV_OTA_COMPLETE && !atomic_get(&writer_stop_requested)) {
 		LOG_WRN("RCV OTA BEGIN: session active (state=%d), sending status", rcv_ota.state);
+		rcv_ota_send_status();
+		return;
+	}
+
+	/* Retire the old owner before even validation can change session state,
+	 * and before resetting buffers or erasing MCUboot staging flash. */
+	if (rcv_ota_stop_writer()) {
 		rcv_ota_send_status();
 		return;
 	}
@@ -417,11 +437,11 @@ static void rcv_ota_handle_begin(const uint8_t *data, size_t len)
 		return;
 	}
 	const struct flash_area *secondary;
-	int area_err = flash_area_open(FIXED_PARTITION_ID(slot1_partition), &secondary);
+	int area_err = flash_area_open(PARTITION_ID(slot1_partition), &secondary);
 	size_t image_offset = area_err ? 0 :
-		boot_get_image_start_offset(FIXED_PARTITION_ID(slot1_partition));
+		boot_get_image_start_offset(PARTITION_ID(slot1_partition));
 	ssize_t trailer_offset = area_err ? area_err :
-		boot_get_area_trailer_status_offset(FIXED_PARTITION_ID(slot1_partition));
+		boot_get_area_trailer_status_offset(PARTITION_ID(slot1_partition));
 	uint32_t mcuboot_capacity = trailer_offset < 0 || (size_t)trailer_offset <= image_offset ?
 		0 : (uint32_t)trailer_offset - image_offset;
 	if (area_err || trailer_offset < 0 || (size_t)trailer_offset <= image_offset ||
@@ -570,7 +590,7 @@ static void rcv_ota_handle_data(const uint8_t *data, size_t len)
 	}
 
 	/* Check for background writer errors */
-	if (writer_error) {
+	if (atomic_get(&writer_error)) {
 		rcv_ota.state = RCV_OTA_ERROR;
 		rcv_ota.error_code = OTA_STATUS_FLASH_ERROR;
 		rcv_ota_send_status();
@@ -729,8 +749,9 @@ static void rcv_ota_handle_activate(void)
 static void rcv_ota_handle_abort(void)
 {
 	LOG_INF("RCV OTA: session aborted");
-	if (writer_running) {
-		rcv_ota_stop_writer();
+	if (rcv_ota_stop_writer()) {
+		rcv_ota_send_status();
+		return;
 	}
 	memset(&rcv_ota, 0, sizeof(rcv_ota));
 	bl_settings_prepared = false;
@@ -743,10 +764,10 @@ static void rcv_ota_writer_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-	while (writer_running) {
+	while (!atomic_get(&writer_stop_requested)) {
 		uint8_t cmd;
 		int ret = k_msgq_get(&page_write_msgq, &cmd, K_FOREVER);
-		if (ret != 0 || !writer_running) {
+		if (ret != 0 || atomic_get(&writer_stop_requested)) {
 			break;
 		}
 
@@ -761,7 +782,7 @@ static void rcv_ota_writer_fn(void *p1, void *p2, void *p3)
 
 		if (cmd == WRITER_CMD_ACTIVATE) {
 			rcv_ota_do_activate();
-			/* Never returns */
+			/* Activation errors can return; the creator must still join us. */
 			break;
 		}
 
@@ -779,7 +800,7 @@ static void rcv_ota_writer_fn(void *p1, void *p2, void *p3)
 		err = flash_erase(flash_dev, addr, RCV_OTA_FLASH_PAGE_SIZE);
 		if (err) {
 			LOG_ERR("RCV OTA: flash erase failed at 0x%05X (err %d)", addr, err);
-			writer_error = true;
+			atomic_set(&writer_error, 1);
 			k_sem_give(slot_sems[cmd]);
 			continue;
 		}
@@ -789,7 +810,7 @@ static void rcv_ota_writer_fn(void *p1, void *p2, void *p3)
 		err = flash_write(flash_dev, addr, req->data, req->len);
 		if (err) {
 			LOG_ERR("RCV OTA: flash write failed at 0x%05X (err %d)", addr, err);
-			writer_error = true;
+			atomic_set(&writer_error, 1);
 			k_sem_give(slot_sems[cmd]);
 			continue;
 		}
@@ -803,13 +824,10 @@ static void rcv_ota_writer_fn(void *p1, void *p2, void *p3)
 
 static void rcv_ota_start_writer(void)
 {
-	/* BEGIN after ERROR/COMPLETE must not double-create on the same stack. */
-	if (writer_running) {
-		rcv_ota_stop_writer();
-	}
-
-	writer_error = false;
-	writer_running = true;
+	/* BEGIN has already joined the old thread before changing its session. */
+	__ASSERT_NO_MSG(!writer_created);
+	atomic_clear(&writer_error);
+	atomic_clear(&writer_stop_requested);
 	k_msgq_purge(&page_write_msgq);
 	/* Reset slot semaphores to available */
 	k_sem_reset(&slot_sem_0);
@@ -817,6 +835,7 @@ static void rcv_ota_start_writer(void)
 	k_sem_reset(&slot_sem_1);
 	k_sem_give(&slot_sem_1);
 
+	writer_created = true;
 	k_thread_create(&rcv_ota_writer_thread, rcv_ota_writer_stack,
 			RCV_OTA_WRITER_STACK_SIZE,
 			rcv_ota_writer_fn, NULL, NULL, NULL,
@@ -824,13 +843,26 @@ static void rcv_ota_start_writer(void)
 	k_thread_name_set(&rcv_ota_writer_thread, "ota_writer");
 }
 
-static void rcv_ota_stop_writer(void)
+static int rcv_ota_stop_writer(void)
 {
-	writer_running = false;
-	/* Send shutdown command to unblock writer thread */
+	if (!writer_created) {
+		return 0;
+	}
+
+	atomic_set(&writer_stop_requested, 1);
+	/* Wake an idle writer. A full queue already guarantees a wakeup. An
+	 * admitted flash operation finishes normally before the thread exits. */
 	uint8_t cmd = WRITER_CMD_SHUTDOWN;
 	k_msgq_put(&page_write_msgq, &cmd, K_NO_WAIT);
-	k_thread_join(&rcv_ota_writer_thread, K_MSEC(5000));
+	int err = k_thread_join(&rcv_ota_writer_thread, K_MSEC(5000));
+	if (err) {
+		LOG_ERR("RCV OTA: writer stop failed (%d); session retained", err);
+		return err;
+	}
+
+	writer_created = false;
+	atomic_clear(&writer_stop_requested);
+	return 0;
 }
 
 /*
@@ -841,7 +873,7 @@ static void rcv_ota_do_verify(void)
 {
 	LOG_INF("RCV OTA: verifying CRC32...");
 
-	if (writer_error) {
+	if (atomic_get(&writer_error)) {
 		LOG_ERR("RCV OTA: flash writer had errors, skipping verify");
 		rcv_ota.state = RCV_OTA_ERROR;
 		rcv_ota.error_code = OTA_STATUS_FLASH_ERROR;
@@ -952,7 +984,7 @@ static void rcv_ota_do_activate(void)
 
 static int rcv_ota_flush_page_buf(void)
 {
-	if (writer_error) {
+	if (atomic_get(&writer_error)) {
 		return -EIO;
 	}
 

@@ -25,6 +25,7 @@
 
 #include <hal/nrf_power.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/usb/usb_ch9.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/drivers/uart.h>
@@ -38,10 +39,9 @@
 #define ADAFRUIT_DFU_MAGIC_SERIAL_ONLY_RESET 0x4E
 
 static void usb_ctrl_thread(void);
-static struct k_thread usb_ctrl_thread_id;
-static K_THREAD_STACK_DEFINE(usb_ctrl_thread_stack, 512);
-static bool usb_ctrl_thread_running;
 static int64_t usb_start_time_ms;
+static K_SEM_DEFINE(usb_ctrl_start_sem, 0, 1);
+static K_MUTEX_DEFINE(usb_serial_transition_lock);
 
 LOG_MODULE_REGISTER(usb, LOG_LEVEL_INF);
 
@@ -108,12 +108,18 @@ USBD_CONFIGURATION_DEFINE(slimevr_fs_config, 0, CONFIG_SLIMEVR_USB_DEVICE_MAX_PO
 			  &slimevr_fs_cfg_desc);
 
 static bool usb_enabled;
-static bool usb_configured;
+static atomic_t usb_configured;
+static atomic_t usb_config_epoch;
 static receiver_usb_state_cb_t receiver_usb_state_callback;
 
 static void receiver_usb_set_configured(bool configured)
 {
-	usb_configured = configured;
+	bool was_configured = atomic_get(&usb_configured) != 0;
+
+	if (was_configured != configured) {
+		atomic_inc(&usb_config_epoch);
+	}
+	atomic_set(&usb_configured, configured ? 1 : 0);
 
 	if (receiver_usb_state_callback != NULL) {
 		receiver_usb_state_callback(configured);
@@ -127,7 +133,7 @@ bool receiver_usb_is_enabled(void)
 
 bool receiver_usb_is_configured(void)
 {
-	return usb_configured;
+	return atomic_get(&usb_configured) != 0;
 }
 
 void receiver_usb_set_state_callback(receiver_usb_state_cb_t callback)
@@ -234,41 +240,34 @@ static int usb_enable_device(struct usbd_context *ctx)
 	return ret;
 }
 
+static void usb_close_serial(bool invalidate)
+{
+	k_mutex_lock(&usb_serial_transition_lock, K_FOREVER);
+	if (get_status(SYS_STATUS_SERIAL_ACTIVE)) {
+		set_status(SYS_STATUS_SERIAL_ACTIVE, false);
+	}
+	if (invalidate) {
+		console_serial_stop();
+	} else {
+		console_serial_close();
+	}
+	log_backend_disable(log_backend_get_by_name("log_backend_uart"));
+	k_mutex_unlock(&usb_serial_transition_lock);
+}
+
 static void status_cb(struct usbd_context *const ctx, const struct usbd_msg *const msg)
 {
 	int ret;
-
+	int disable_ret;
 	switch (msg->type) {
 	case USBD_MSG_RESET:
 		receiver_usb_set_configured(false);
-		if (usb_ctrl_thread_running) {
-			k_thread_abort(&usb_ctrl_thread_id);
-			usb_ctrl_thread_running = false;
-		}
-		if (get_status(SYS_STATUS_SERIAL_ACTIVE)) {
-			set_status(SYS_STATUS_SERIAL_ACTIVE, false);
-		}
-		console_serial_stop();
-		log_backend_disable(log_backend_get_by_name("log_backend_uart"));
+		usb_close_serial(true);
 		break;
 	case USBD_MSG_CONFIGURATION:
 		receiver_usb_set_configured(msg->status != 0);
-		if (msg->status != 0 && !usb_ctrl_thread_running) {
-			usb_ctrl_thread_running = true;
-			k_thread_create(&usb_ctrl_thread_id, usb_ctrl_thread_stack,
-					K_THREAD_STACK_SIZEOF(usb_ctrl_thread_stack),
-					(k_thread_entry_t)usb_ctrl_thread, NULL, NULL, NULL,
-					USB_INIT_THREAD_PRIORITY, 0, K_NO_WAIT);
-		} else if (msg->status == 0) {
-			if (usb_ctrl_thread_running) {
-				k_thread_abort(&usb_ctrl_thread_id);
-				usb_ctrl_thread_running = false;
-			}
-			if (get_status(SYS_STATUS_SERIAL_ACTIVE)) {
-				set_status(SYS_STATUS_SERIAL_ACTIVE, false);
-			}
-			console_serial_stop();
-			log_backend_disable(log_backend_get_by_name("log_backend_uart"));
+		if (msg->status == 0) {
+			usb_close_serial(true);
 		}
 		break;
 	case USBD_MSG_VBUS_READY:
@@ -279,18 +278,11 @@ static void status_cb(struct usbd_context *const ctx, const struct usbd_msg *con
 		break;
 	case USBD_MSG_VBUS_REMOVED:
 		receiver_usb_set_configured(false);
-		if (usb_ctrl_thread_running) {
-			k_thread_abort(&usb_ctrl_thread_id);
-			usb_ctrl_thread_running = false;
-		}
-		if (get_status(SYS_STATUS_SERIAL_ACTIVE)) {
-			set_status(SYS_STATUS_SERIAL_ACTIVE, false);
-		}
-		console_serial_stop();
-		log_backend_disable(log_backend_get_by_name("log_backend_uart"));
+		usb_close_serial(true);
 		usb_enabled = false;
-		if (usbd_disable(ctx) != 0) {
-			LOG_ERR("Failed to disable USB device");
+		disable_ret = usbd_disable(ctx);
+		if (disable_ret != 0) {
+			LOG_ERR("Failed to disable USB device: %d", disable_ret);
 		}
 		break;
 	default:
@@ -302,12 +294,11 @@ static void status_cb(struct usbd_context *const ctx, const struct usbd_msg *con
 static void usb_init_thread(void)
 {
 	int ret = usbd_setup(status_cb);
-	usb_start_time_ms = k_uptime_get();
-
 	if (ret != 0) {
 		return;
 	}
 
+	usb_start_time_ms = k_uptime_get();
 	if (!usbd_can_detect_vbus(&slimevr_usbd) || usb_vbus_present()) {
 		ret = usb_enable_device(&slimevr_usbd);
 		if (ret != 0) {
@@ -315,6 +306,8 @@ static void usb_init_thread(void)
 			return;
 		}
 	}
+
+	k_sem_give(&usb_ctrl_start_sem);
 }
 
 static void usb_ctrl_thread(void)
@@ -323,48 +316,100 @@ static void usb_ctrl_thread(void)
 	const struct device *const dev_console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 	uint32_t dtr;
 	uint32_t last_dtr = 0;
-
+	uint32_t seen_config_epoch = 0;
+	bool serial_active;
 #if DFU_EXISTS
-	// Filter only the initial wake/reset fluctuation. A button that remains
-	// held after the startup window is an intentional DFU request.
-	bool enter_dfu = k_uptime_get() - usb_start_time_ms < 100
-		? button_read_filtered()
-		: button_read();
-	if (enter_dfu) {
-		sys_enter_dfu(false);
-	}
+	bool button_checked_for_config = false;
+	bool button_raw_recheck_pending = false;
 #endif
 
-	// Watch DTR (terminal attached) for SERIAL_ACTIVE status and 1200 baud DFU touch.
+	k_sem_take(&usb_ctrl_start_sem, K_FOREVER);
+
+	// The watcher is permanent; USB lifecycle events only gate its polling.
 	while (1) {
+		uint32_t config_epoch = (uint32_t)atomic_get(&usb_config_epoch);
+
+		if (!receiver_usb_is_configured()) {
+			last_dtr = 0;
+			seen_config_epoch = config_epoch;
+#if DFU_EXISTS
+			button_checked_for_config = false;
+			button_raw_recheck_pending = false;
+#endif
+			k_msleep(10);
+			continue;
+		}
+
+		if (config_epoch != seen_config_epoch) {
+			seen_config_epoch = config_epoch;
+			last_dtr = 0;
+#if DFU_EXISTS
+			button_checked_for_config = false;
+			button_raw_recheck_pending = false;
+#endif
+		}
+
+#if DFU_EXISTS
+		if (!button_checked_for_config) {
+			int64_t since_start_ms = k_uptime_get() - usb_start_time_ms;
+			bool enter_dfu = since_start_ms < 100
+				? button_read_filtered()
+				: button_read();
+			button_checked_for_config = true;
+			button_raw_recheck_pending = since_start_ms < 100;
+			if (enter_dfu) {
+				sys_enter_dfu(false);
+			}
+		} else if (button_raw_recheck_pending &&
+			   k_uptime_get() - usb_start_time_ms >= 100) {
+			button_raw_recheck_pending = false;
+			if (button_read()) {
+				sys_enter_dfu(false);
+			}
+		}
+#endif
+
 		dtr = 0;
-		uart_line_ctrl_get(dev_console, UART_LINE_CTRL_DTR, &dtr);
-		if (dtr == last_dtr) {
+		if (uart_line_ctrl_get(dev_console, UART_LINE_CTRL_DTR, &dtr) != 0) {
+			dtr = 0;
+		}
+		serial_active = get_status(SYS_STATUS_SERIAL_ACTIVE);
+		if (dtr == last_dtr && ((dtr != 0U) == serial_active)) {
 			k_msleep(10);
 			continue;
 		}
 		last_dtr = dtr;
+
 		if (dtr) {
-			set_status(SYS_STATUS_SERIAL_ACTIVE, true);
-			console_serial_start();
-			log_backend_enable(backend, backend->cb->ctx, CONFIG_LOG_MAX_LEVEL);
+			k_mutex_lock(&usb_serial_transition_lock, K_FOREVER);
+			if (receiver_usb_is_configured()) {
+				set_status(SYS_STATUS_SERIAL_ACTIVE, true);
+				console_serial_start();
+				log_backend_enable(backend, backend->cb->ctx, CONFIG_LOG_MAX_LEVEL);
+			}
+			k_mutex_unlock(&usb_serial_transition_lock);
 		} else {
 #if CONFIG_BUILD_OUTPUT_UF2
 			// Adafruit UF2 supports the 1200 baud serial-only DFU touch.
 			uint32_t baudrate = 0;
-			uart_line_ctrl_get(dev_console, UART_LINE_CTRL_BAUD_RATE, &baudrate);
-			if (baudrate == 1200) {
+			bool request_dfu = uart_line_ctrl_get(dev_console, UART_LINE_CTRL_BAUD_RATE,
+							      &baudrate) == 0 && baudrate == 1200;
+			if (request_dfu) {
 				NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SERIAL_ONLY_RESET;
+				usb_close_serial(true);
 				k_msleep(100);
 				sys_request_system_reboot();
+				continue;
 			}
 #endif
-			set_status(SYS_STATUS_SERIAL_ACTIVE, false);
-			console_serial_stop();
-			log_backend_disable(backend);
+			usb_close_serial(false);
 		}
 	}
 }
 
-/* below ESB_THREAD_PRIORITY; one-shot USB init must not outrank radio */
-K_THREAD_DEFINE(usb_init_thread_id, 512, usb_init_thread, NULL, NULL, NULL, USB_INIT_THREAD_PRIORITY, 0, 500);
+/* below ESB_THREAD_PRIORITY; the USB control watcher stays alive across
+ * configuration changes, while one-shot USB init must not outrank radio. */
+K_THREAD_DEFINE(usb_ctrl_thread_id, 512, usb_ctrl_thread, NULL, NULL, NULL,
+		USB_INIT_THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(usb_init_thread_id, 512, usb_init_thread, NULL, NULL, NULL,
+		USB_INIT_THREAD_PRIORITY, 0, 500);

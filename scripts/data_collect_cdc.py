@@ -21,8 +21,8 @@ Packet types in payload:
   gyrQuat: accumulated gyro quaternion + accel/body-frame aligned mag
 
 Output: CSV file with columns depending on mode:
-  raw mode:      seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp
-  gyr_quat mode: seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp
+  raw mode:      seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp,discontinuity
+  gyr_quat mode: seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp,discontinuity
 """
 
 import argparse
@@ -31,7 +31,20 @@ import struct
 import sys
 import time
 from pathlib import Path
+from data_collect_reorder import SampleReorder
 
+
+from data_collect_common import (
+    META_MASK_ACCEL,
+    META_MASK_BASIC,
+    META_MASK_GYRO,
+    META_MASK_MAG,
+    META_MASK_TCAL_POINTS,
+    META_MASK_TCAL_STATE,
+    MetadataRepairScheduler,
+    make_control_sender,
+    receiver_serial_for_cdc,
+)
 # SlimeNRF Receiver USB IDs
 SLIME_VID = 0x1209
 SLIME_PID = 0x7690
@@ -116,96 +129,84 @@ class CalibrationData:
         self.tcal_temp_min = 0.0
         self.tcal_temp_max = 0.0
         self.tcal_correction_offset = None
-        self.tcal_points = []  # list of (temp, bx, by, bz)
-        self._tcal_pending_points = []
-        self._tcal_pending_chunk_idx = -1
+        self.tcal_state_received = False
+        self.tcal_points = []
+        self.tcal_complete = False
+        self._tcal_chunks = {}
 
     @staticmethod
     def _is_valid_tcal_point(point):
-        temp, bx, by, bz = point
-        if not all(math.isfinite(v) for v in point):
-            return False
-        return not (temp == 0.0 and bx == 0.0 and by == 0.0 and bz == 0.0)
+        return all(math.isfinite(v) for v in point) and not all(v == 0.0 for v in point)
 
     @classmethod
     def _normalize_tcal_points(cls, points):
         deduped = {}
         for point in points:
-            if not cls._is_valid_tcal_point(point):
-                continue
-            deduped[f"{point[0]:.2f}"] = point
-        return [deduped[key] for key in sorted(deduped, key=lambda k: float(k))]
+            if cls._is_valid_tcal_point(point):
+                deduped[f"{point[0]:.2f}"] = point
+        return [deduped[key] for key in sorted(deduped, key=float)]
 
     def parse(self, payload: bytes):
-        """Parse a calibration packet. Sub-type at byte[2]."""
         if len(payload) < 4:
             return
         sub_type = payload[2]
-        if sub_type == 0x01:  # ACCEL_CAL
-            if len(payload) >= 51:
-                self.accel_BAinv = list(struct.unpack_from("<12f", payload, 3))
-                print(f"  Calibration: accel BAinv received")
-        elif sub_type == 0x02:  # MAG_CAL
-            if len(payload) >= 51:
-                self.mag_BAinv = list(struct.unpack_from("<12f", payload, 3))
-                print(f"  Calibration: mag BAinv received")
-        elif sub_type == 0x03:  # GYRO_CAL
-            if len(payload) >= 27:
-                self.gyro_bias = list(struct.unpack_from("<3f", payload, 3))
-                self.gyro_sens_scale = list(struct.unpack_from("<3f", payload, 15))
-                print(f"  Calibration: gyro bias + sens received")
-        elif sub_type == 0x04:  # TCAL_STATE
-            if len(payload) >= 26:
-                self.tcal_enabled = bool(payload[3])
-                self.tcal_num_points = struct.unpack_from("<H", payload, 4)[0]
-                self.tcal_temp_min = struct.unpack_from("<f", payload, 6)[0]
-                self.tcal_temp_max = struct.unpack_from("<f", payload, 10)[0]
-                self.tcal_correction_offset = list(struct.unpack_from("<3f", payload, 14))
-                print(
-                    f"  Calibration: T-Cal state (enabled={self.tcal_enabled}, "
-                    f"points={self.tcal_num_points}, "
-                    f"range={self.tcal_temp_min:.0f}-{self.tcal_temp_max:.0f}°C)"
-                )
-                if self.tcal_num_points == 0:
-                    self.tcal_points = []
-                    self._tcal_pending_points = []
-                    self._tcal_pending_chunk_idx = -1
-        elif sub_type == 0x05:  # TCAL_POINTS
-            if len(payload) >= 23:
-                chunk_idx = payload[3]
-                total_count = struct.unpack_from("<H", payload, 4)[0]
-                num_in_chunk = payload[6]
-                last_chunk_idx = ((total_count - 1) // 2) if total_count > 0 else 0
-                if chunk_idx == 0 or self._tcal_pending_chunk_idx >= chunk_idx:
-                    self._tcal_pending_points = []
-                for j in range(num_in_chunk):
-                    offset = 7 + j * 16
-                    if offset + 16 <= len(payload):
-                        temp, bx, by, bz = struct.unpack_from("<4f", payload, offset)
-                        self._tcal_pending_points.append((temp, bx, by, bz))
-                self._tcal_pending_chunk_idx = chunk_idx
-                normalized = self._normalize_tcal_points(self._tcal_pending_points)
-                if not self.tcal_points:
-                    self.tcal_points = normalized
-                    self.tcal_num_points = len(self.tcal_points)
-                if chunk_idx >= last_chunk_idx:
-                    self.tcal_points = normalized
-                    self._tcal_pending_points = []
-                    self._tcal_pending_chunk_idx = -1
-                    self.tcal_num_points = len(self.tcal_points)
-                if len(normalized) <= 2:
-                    print(f"  Calibration: T-Cal points receiving...")
+        if sub_type == 0x01 and len(payload) >= 51:
+            self.accel_BAinv = list(struct.unpack_from("<12f", payload, 3))
+        elif sub_type == 0x02 and len(payload) >= 51:
+            self.mag_BAinv = list(struct.unpack_from("<12f", payload, 3))
+        elif sub_type == 0x03 and len(payload) >= 27:
+            self.gyro_bias = list(struct.unpack_from("<3f", payload, 3))
+            self.gyro_sens_scale = list(struct.unpack_from("<3f", payload, 15))
+        elif sub_type == 0x04 and len(payload) >= 26:
+            self.tcal_state_received = True
+            self.tcal_enabled = bool(payload[3])
+            total_count = struct.unpack_from("<H", payload, 4)[0]
+            if total_count != self.tcal_num_points:
+                self._tcal_chunks.clear()
+            self.tcal_num_points = total_count
+            self.tcal_temp_min = struct.unpack_from("<f", payload, 6)[0]
+            self.tcal_temp_max = struct.unpack_from("<f", payload, 10)[0]
+            self.tcal_correction_offset = list(struct.unpack_from("<3f", payload, 14))
+            self._complete_tcal()
+        elif sub_type == 0x05 and len(payload) >= 7:
+            chunk_idx = payload[3]
+            total_count = struct.unpack_from("<H", payload, 4)[0]
+            count = payload[6]
+            if self.tcal_state_received and total_count != self.tcal_num_points:
+                return
+            if total_count != self.tcal_num_points:
+                self._tcal_chunks.clear()
+            if total_count == 0:
+                self.tcal_num_points = 0
+                self._complete_tcal()
+                return
+            expected_count = min(2, total_count - 2 * chunk_idx)
+            if expected_count <= 0 or count != expected_count or len(payload) < 7 + 16 * count:
+                return
+            points = [struct.unpack_from("<4f", payload, 7 + j * 16) for j in range(count)]
+            if not all(self._is_valid_tcal_point(point) for point in points):
+                return
+            self.tcal_num_points = total_count
+            self._tcal_chunks[chunk_idx] = points
+            self._complete_tcal()
+
+    def _complete_tcal(self):
+        expected = (self.tcal_num_points + 1) // 2
+        self.tcal_points = []
+        self.tcal_complete = False
+        if self.tcal_state_received and all(i in self._tcal_chunks for i in range(expected)):
+            points = self._normalize_tcal_points(
+                point for i in range(expected) for point in self._tcal_chunks[i]
+            )
+            if len(points) == self.tcal_num_points:
+                self.tcal_points = points
+                self.tcal_complete = True
 
     def write_to_file(self, f):
-        """Append calibration data to metadata file (vqf_core.py-compatible format)."""
-        self.tcal_points = self._normalize_tcal_points(self.tcal_points)
-        self.tcal_num_points = len(self.tcal_points)
         f.write("\n# Calibration data (from tracker retained memory)\n")
-        # Accel: split BAinv[12] → bias (row 0) + matrix (rows 1-3)
         if self.accel_BAinv is not None and len(self.accel_BAinv) == 12:
             f.write(f"acc_cal_bias={','.join(f'{v:.9g}' for v in self.accel_BAinv[:3])}\n")
             f.write(f"acc_cal_matrix={','.join(f'{v:.9g}' for v in self.accel_BAinv[3:])}\n")
-        # Mag: split BAinv[12] → bias (row 0) + matrix (rows 1-3)
         if self.mag_BAinv is not None and len(self.mag_BAinv) == 12:
             f.write(f"mag_cal_bias={','.join(f'{v:.9g}' for v in self.mag_BAinv[:3])}\n")
             f.write(f"mag_cal_matrix={','.join(f'{v:.9g}' for v in self.mag_BAinv[3:])}\n")
@@ -213,15 +214,14 @@ class CalibrationData:
             f.write(f"gyro_bias={','.join(f'{v:.9g}' for v in self.gyro_bias)}\n")
         if self.gyro_sens_scale is not None:
             f.write(f"gyro_sens_scale={','.join(f'{v:.9g}' for v in self.gyro_sens_scale)}\n")
-        # T-Cal: compact gyro_tcal format (temp:bx,by,bz;temp:bx,by,bz;...)
-        if self.tcal_points:
-            entries = [f"{t:.2f}:{bx:.5f},{by:.5f},{bz:.5f}"
-                       for t, bx, by, bz in self.tcal_points]
+        if self.tcal_complete and self.tcal_points:
+            entries = [f"{t:.2f}:{bx:.5f},{by:.5f},{bz:.5f}" for t, bx, by, bz in self.tcal_points]
             f.write(f"gyro_tcal={';'.join(entries)}\n")
-
+        f.write(f"tcal_declared_points={self.tcal_num_points}\n")
+        f.write(f"tcal_complete={int(self.tcal_complete)}\n")
     @property
     def has_data(self):
-        return any([self.accel_BAinv, self.mag_BAinv, self.gyro_bias, self.tcal_enabled, self.tcal_points])
+        return bool(self.accel_BAinv or self.mag_BAinv or self.gyro_bias or self.tcal_state_received)
 
 
 def parse_raw_imu(payload: bytes, meta: SensorMetadata):
@@ -302,8 +302,8 @@ def parse_raw_mag(payload: bytes, _meta: SensorMetadata):
     }
 
 
-def read_frames(port, baudrate=115200):
-    """Generator that yields parsed frames from serial port."""
+def read_frames(port, baudrate=115200, yield_idle=False):
+    """Generator yielding parsed frames; optionally emits timeout heartbeats."""
     import serial
 
     ser = serial.Serial(port, baudrate, timeout=0.1)
@@ -362,30 +362,29 @@ def read_frames(port, baudrate=115200):
                 buf = buf[total_frame:]
 
             if not data:
-                time.sleep(0.001)
+                if yield_idle:
+                    yield None
+                else:
+                    time.sleep(0.001)
     finally:
         ser.close()
-
 
 class TrackerCollectionState:
     """Independent collection state for one tracker stream."""
 
-    REORDER_BUF_MAX = 200
-
     def __init__(self, output_path, tracker_id=None):
         self.tracker_id = tracker_id
+        self.control_tracker_id = tracker_id if tracker_id is not None else 0
         self.meta = SensorMetadata()
         self.cal = CalibrationData()
         self.frame_count = 0
         self.sample_count = 0
         self.last_status_samples = 0
         self.last_rssi = 0
-        self.retransmit_count = 0
-        self.gap_count = 0
+        self.reorder = SampleReorder(self._write_sample)
         self.data_mode = "raw"
         self.meta_written = False
-        self.reorder_buf = {}
-        self.write_cursor = None
+        self.reorder_buf = self.reorder.pending
         self.first_sample_time = None
         self.csv_file = None
         self.base = Path(output_path)
@@ -398,14 +397,43 @@ class TrackerCollectionState:
             self.meta_path = self.base.with_suffix(".meta.txt")
             self.csv_path = self.base.with_suffix(".csv")
 
-    def _csv_header(self):
-        if self.data_mode == "gyr_quat":
-            return "seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp\n"
-        return "seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp\n"
+    def metadata_complete(self):
+        if not self.meta.received or self.cal.accel_BAinv is None or self.cal.gyro_bias is None:
+            return False
+        if self.meta.mag_id and self.cal.mag_BAinv is None:
+            return False
+        return self.cal.tcal_state_received and self.cal.tcal_complete
+    def missing_metadata_request(self):
+        if not self.meta.received:
+            return META_MASK_BASIC, 255
+        mask = 0
+        if self.cal.accel_BAinv is None:
+            mask |= META_MASK_ACCEL
+        if self.meta.mag_id and self.cal.mag_BAinv is None:
+            mask |= META_MASK_MAG
+        if self.cal.gyro_bias is None:
+            mask |= META_MASK_GYRO
+        if not self.cal.tcal_complete or not self.cal.tcal_state_received:
+            if not self.cal.tcal_state_received:
+                mask |= META_MASK_TCAL_STATE
+            if self.cal.tcal_num_points:
+                mask |= META_MASK_TCAL_POINTS
+                chunk_count = (self.cal.tcal_num_points + 1) // 2
+                for chunk in range(chunk_count):
+                    if chunk not in self.cal._tcal_chunks:
+                        return mask, chunk
+            else:
+                mask |= META_MASK_TCAL_POINTS
+            return mask, 255
+        return (mask, 255) if mask else None
 
     @property
     def label(self):
         return f"tracker {self.tracker_id}" if self.tracker_id is not None else "main"
+    def _csv_header(self):
+        if self.data_mode == "gyr_quat":
+            return "seq,qw,qx,qy,qz,ax,ay,az,mx,my,mz,temp,discontinuity\n"
+        return "seq,gx,gy,gz,ax,ay,az,mx,my,mz,temp,discontinuity\n"
 
     def _ensure_csv(self):
         if self.csv_file is None:
@@ -415,6 +443,8 @@ class TrackerCollectionState:
     def _switch_to_quat(self):
         if self.data_mode != "raw":
             return
+        if self.sample_count or self.reorder_buf:
+            raise ValueError("Cannot change raw/quat mode within one CSV capture")
         self.data_mode = "gyr_quat"
         if self.csv_file is not None:
             self.csv_file.close()
@@ -422,9 +452,8 @@ class TrackerCollectionState:
             self.csv_file.write(self._csv_header())
 
     def _write_metadata(self):
-        if self.meta_written or not self.meta.received:
+        if not self.meta.received:
             return
-        self.meta_written = True
         with open(self.meta_path, "w", encoding="utf-8") as f:
             f.write(f"gyro_range_dps={self.meta.gyro_range}\n")
             f.write(f"accel_range_g={self.meta.accel_range}\n")
@@ -441,9 +470,9 @@ class TrackerCollectionState:
             f.write(f"data_mode={self.data_mode}\n")
             if self.cal.has_data:
                 self.cal.write_to_file(f)
-        print(f"  Metadata + calibration written to {self.meta_path}")
+        self.meta_written = True
 
-    def _format_sample(self, sample):
+    def _format_sample(self, sample, discontinuity=False):
         mag = sample.get("mag") or (0.0, 0.0, 0.0)
         temp = sample.get("temp_c") or 0.0
         seq = sample["seq"]
@@ -454,37 +483,32 @@ class TrackerCollectionState:
                 f"{q[0]:.9f},{q[1]:.9f},{q[2]:.9f},{q[3]:.9f},"
                 f"{sample['accel'][0]:.6f},{sample['accel'][1]:.6f},{sample['accel'][2]:.6f},"
                 f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
-                f"{temp:.6f}\n"
+                f"{temp:.6f},{int(discontinuity)}\n"
             )
         return (
             f"{seq},"
             f"{sample['gyro'][0]:.6f},{sample['gyro'][1]:.6f},{sample['gyro'][2]:.6f},"
             f"{sample['accel'][0]:.6f},{sample['accel'][1]:.6f},{sample['accel'][2]:.6f},"
             f"{mag[0]:.6f},{mag[1]:.6f},{mag[2]:.6f},"
-            f"{temp:.6f}\n"
+            f"{temp:.6f},{int(discontinuity)}\n"
         )
 
-    def _flush_buffer(self, force=False):
-        if not self.reorder_buf or self.write_cursor is None:
-            return
-        if not force:
-            while self.write_cursor in self.reorder_buf:
-                self.csv_file.write(self.reorder_buf.pop(self.write_cursor))
-                self.sample_count += 1
-                self.write_cursor = (self.write_cursor + 1) & 0xFFFF
-            return
-        for seq in sorted_seqs:
-            gap = (seq - self.write_cursor) & 0xFFFF
-            if gap > 0:
-                self.gap_count += gap
-                self.write_cursor = seq
-            self.csv_file.write(self.reorder_buf[seq])
-            self.sample_count += 1
-            self.write_cursor = (self.write_cursor + 1) & 0xFFFF
-        self.reorder_buf.clear()
+    @property
+    def gap_count(self):
+        return self.reorder.gap_count
+
+    @property
+    def retransmit_count(self):
+        return self.reorder.retransmit_count
+
+    def _write_sample(self, sample, discontinuity):
+        self.csv_file.write(self._format_sample(sample, discontinuity))
+        self.sample_count += 1
 
     def handle_payload(self, payload, rssi, now):
         pkt_type = payload[0]
+        if self.tracker_id is None and len(payload) >= 2:
+            self.control_tracker_id = payload[1]
         self.frame_count += 1
         self.last_rssi = rssi
         if pkt_type == 0x12:
@@ -495,69 +519,25 @@ class TrackerCollectionState:
             return
         if pkt_type == 0x14:
             self.cal.parse(payload)
-            print(
-                f"  {self.label}: Cal sub={payload[2]} accel={self.cal.accel_BAinv is not None} "
-                f"mag={self.cal.mag_BAinv is not None} "
-                f"gyro={self.cal.gyro_bias is not None}"
-            )
+            print(f"  {self.label}: Cal sub={payload[2]} accel={self.cal.accel_BAinv is not None} mag={self.cal.mag_BAinv is not None} gyro={self.cal.gyro_bias is not None}")
             return
-        if pkt_type != 0x10 and pkt_type != 0x13:
+        if pkt_type not in (0x10, 0x13):
             return
-
+        if pkt_type == 0x10 and self.data_mode == "gyr_quat":
+            raise ValueError("Cannot change raw/quat mode within one CSV capture")
         if pkt_type == 0x13:
             self._switch_to_quat()
         self._ensure_csv()
         self._write_metadata()
-        sample = (
-            parse_raw_imu_quat(payload, self.meta)
-            if pkt_type == 0x13 else parse_raw_imu(payload, self.meta)
-        )
+        sample = parse_raw_imu_quat(payload, self.meta) if pkt_type == 0x13 else parse_raw_imu(payload, self.meta)
         if sample is None:
             return
-        seq = sample["seq"]
-        if self.tracker_id is not None:
-            # Batch mode: no dup, no ARQ — a per-tracker stream arrives in
-            # seq order and gaps are permanent. Write on arrival and count
-            # gaps immediately instead of waiting in a reorder buffer.
-            if self.write_cursor is None:
-                self.write_cursor = seq
-                self.first_sample_time = now
-            else:
-                diff = (seq - self.write_cursor) & 0xFFFF
-                if diff > 0x8000:
-                    self.retransmit_count += 1
-                    return  # stale duplicate of already-written data
-                if diff > 0:
-                    self.gap_count += diff  # seqs [cursor, seq) never arrive
-            self.csv_file.write(self._format_sample(sample))
-            self.sample_count += 1
-            self.write_cursor = (seq + 1) & 0xFFFF
-            return
-
-        if self.write_cursor is not None:
-            diff = (seq - self.write_cursor) & 0xFFFF
-            if diff > 0x8000:
-                self.retransmit_count += 1
-                return
-        if seq in self.reorder_buf:
-            return
-        if self.write_cursor is None:
-            self.write_cursor = seq
+        if self.first_sample_time is None:
             self.first_sample_time = now
-        self.reorder_buf[seq] = self._format_sample(sample)
-        diff = (seq - self.write_cursor) & 0xFFFF
-        if 0 < diff < self.REORDER_BUF_MAX:
-            if any(
-                0 < ((other - seq) & 0xFFFF) < self.REORDER_BUF_MAX
-                for other in self.reorder_buf if other != seq
-            ):
-                self.retransmit_count += 1
-        self._flush_buffer()
-        if len(self.reorder_buf) >= self.REORDER_BUF_MAX:
-            self._flush_buffer(force=True)
+        self.reorder.push(sample, bytes(payload))
 
     def finalize(self, data_duration):
-        self._flush_buffer(force=True)
+        self.reorder.finish()
         if self.csv_file is not None:
             self.csv_file.close()
             self.csv_file = None
@@ -570,9 +550,10 @@ class TrackerCollectionState:
                 f.write(f"duration_s={data_duration:.3f}\n")
                 f.write(f"sample_count={self.sample_count}\n")
                 f.write(f"gap_count={self.gap_count}\n")
+                f.write(f"unknown_boundaries={self.reorder.unknown_boundaries}\n")
 
 
-def collect(port, output_path, duration=None, batch=False):
+def collect(port, output_path, duration=None, batch=False, control_port=None, baudrate=115200):
     """Collect raw data, optionally maintaining independent tracker states."""
     start_time = time.time()
     last_status = start_time
@@ -582,6 +563,12 @@ def collect(port, output_path, duration=None, batch=False):
     legacy_state = TrackerCollectionState(output_path)
     if not batch:
         legacy_state._ensure_csv()
+    sender = make_control_sender(
+        control_port,
+        receiver_serial=receiver_serial_for_cdc(port),
+        baudrate=baudrate,
+    )
+    scheduler = MetadataRepairScheduler(sender, session_start=start_time)
 
     print(f"Collecting data from {port}...")
     if batch:
@@ -593,7 +580,11 @@ def collect(port, output_path, duration=None, batch=False):
     print("Press Ctrl+C to stop\n")
 
     try:
-        for esb_payload, rssi, rx_ticks in read_frames(port):
+        for frame in read_frames(port, baudrate, yield_idle=True):
+            if frame is None:
+                scheduler.service(list(states.values()) if batch else [legacy_state], time.time())
+                continue
+            esb_payload, rssi, rx_ticks = frame
             if not esb_payload:
                 continue
             pkt_type = esb_payload[0]
@@ -611,6 +602,7 @@ def collect(port, output_path, duration=None, batch=False):
             else:
                 state = legacy_state
             now = time.time()
+            scheduler.service(list(states.values()) if batch else [legacy_state], now)
             state.handle_payload(esb_payload, rssi, now)
 
             if now - last_status >= 2.0:
@@ -668,8 +660,10 @@ def collect(port, output_path, duration=None, batch=False):
         end_time = time.time()
         data_duration = end_time - first_sample if first_sample else 0
         for state in all_states:
+            state._write_metadata()
             state_duration = end_time - state.first_sample_time if state.first_sample_time else 0
             state.finalize(state_duration)
+        scheduler.close()
 
     sample_count = sum(s.sample_count for s in all_states)
     gap_count = sum(s.gap_count for s in all_states)
@@ -681,6 +675,7 @@ def collect(port, output_path, duration=None, batch=False):
     print(f"  Samples: {sample_count}")
     print(f"  Retransmits received: {retransmit_count}")
     print(f"  Gaps (lost): {gap_count} ({loss_pct:.2f}%)")
+    print(f"  Unknown boundaries: {sum(s.reorder.unknown_boundaries for s in all_states)}")
     for state in all_states:
         if batch:
             print(f"  Tracker-{state.tracker_id}: {state.sample_count} samples -> {state.csv_path}")
@@ -719,7 +714,7 @@ def find_data_port():
     for i, p in enumerate(candidates):
         iface = getattr(p, 'interface_number', '?')
         print(f"  [{i}] {p.device}  (interface={iface}, {p.description})")
-    print(f"\nData port is usually the higher-numbered port.")
+    print("\nData port is usually the higher-numbered port.")
     print(f"Specify the port manually, e.g.: data_collect.py {candidates[-1].device}")
     return None
 
@@ -760,7 +755,11 @@ def main():
         action="store_true",
         help="Collect independent output files for each tracker ID",
     )
-
+    parser.add_argument(
+        "--control-port",
+        default=None,
+        help="CDC console port for collectmeta requests; otherwise use serial-matched HID control.",
+    )
 
     args = parser.parse_args()
 
@@ -777,8 +776,14 @@ def main():
             print("Error: No SlimeNRF receiver found. "
                   "Specify port manually, e.g.: data_collect.py /dev/ttyACM1")
             sys.exit(1)
-
-    collect(port, args.output, args.duration, batch=args.batch)
+    collect(
+        port,
+        args.output,
+        args.duration,
+        batch=args.batch,
+        control_port=args.control_port,
+        baudrate=args.baudrate,
+    )
 
 
 

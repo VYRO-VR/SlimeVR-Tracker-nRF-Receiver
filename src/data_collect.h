@@ -38,6 +38,7 @@ void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi);
 /* Runtime control: start/stop data collection for a specific tracker */
 void data_collect_start(uint8_t tracker_id);
 void data_collect_stop(void);
+void data_collect_forget_tracker(uint8_t tracker_id);
 bool data_collect_is_active(void);
 uint8_t data_collect_get_target_id(void);
 
@@ -55,6 +56,7 @@ static inline int data_collect_init(void) { return 0; }
 static inline void data_collect_write(const uint8_t *data, uint8_t len, uint8_t rssi) { (void)data; (void)len; (void)rssi; }
 static inline void data_collect_start(uint8_t tracker_id) { (void)tracker_id; }
 static inline void data_collect_stop(void) {}
+static inline void data_collect_forget_tracker(uint8_t tracker_id) { (void)tracker_id; }
 static inline bool data_collect_is_active(void) { return false; }
 static inline uint8_t data_collect_get_target_id(void) { return 0; }
 static inline void data_collect_batch_start(uint32_t mask, uint16_t rate_hz) { (void)mask; (void)rate_hz; }

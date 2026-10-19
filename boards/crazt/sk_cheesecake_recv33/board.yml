@@ -1,0 +1,11 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+board:
+  name: sk_cheesecake_recv33
+  full_name: SK Cheesecake Receiver 33
+  vendor: crazt
+  socs:
+    - name: nrf52833
+      variants:
+        - name: uf2
