@@ -12,7 +12,8 @@
 /* All receiver boards currently enabling FEM are nRF52. A future DPPI FEM
  * board needs an owned, published DISABLED channel and radio-domain timer;
  * a peripheral address is NOT a valid MPSL generic event on those SoCs. */
-#if !defined(CONFIG_SOC_SERIES_NRF52)
+#if !defined(CONFIG_SOC_SERIES_NRF52) && !defined(CONFIG_SOC_SERIES_NRF52X) && \
+	!defined(CONFIG_SOC_NRF52840) && !defined(CONFIG_SOC_NRF52833)
 #error "RSSI FEM requires nRF52 PPI; DPPI FEM needs owned DISABLED publication and radio-domain TIMER"
 #endif
 
